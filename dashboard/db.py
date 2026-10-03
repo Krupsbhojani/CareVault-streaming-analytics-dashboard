@@ -60,7 +60,7 @@ def _pool() -> ConnectionPool:
         name="carevault-dashboard",
         open=True,
     )
-    p.wait(timeout=5.0)
+    p.wait(timeout=30.0)
     return p
 
 
