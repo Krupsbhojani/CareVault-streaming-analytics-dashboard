@@ -1,0 +1,8 @@
+# Postgres 18 + pg_partman, so the local schema matches what Azure will run.
+# postgresql-18-partman ships in the pgdg repo baked into postgres:18.
+FROM postgres:18
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends postgresql-18-partman; \
+    rm -rf /var/lib/apt/lists/*

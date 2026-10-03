@@ -1,0 +1,53 @@
+# CareVault — files that should never be checked in.
+
+# --- secrets ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*secret*
+*credentials*
+
+# --- raw data (896 MB; cohort source files, derived parquets, interim) -----
+# bench/ keeps its own small result CSVs (checked in on purpose) so this is
+# narrower than a global *.csv ignore.
+data/
+*.parquet
+
+# --- scratch (local notes, logs, screenshots, benchmark exports) -----------
+scratch/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.tox/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- virtual envs ----------------------------------------------------------
+.venv/
+.venv-*/
+venv/
+env/
+
+# --- Claude Code local settings --------------------------------------------
+.claude/
+
+# --- editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- docker local volume ---------------------------------------------------
+pg_data/
+
+# --- figures/eval outputs that regenerate ---------------------------------
+eval/figures/*.png

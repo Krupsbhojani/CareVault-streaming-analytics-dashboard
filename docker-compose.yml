@@ -1,0 +1,33 @@
+name: carevault
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
+    image: carevault/postgres:18-partman
+    container_name: carevault-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: carevault
+      POSTGRES_USER: carevault
+      POSTGRES_PASSWORD: carevault
+      TZ: UTC
+    ports:
+      # Host port 5433 -> container 5432, since another Postgres may already
+      # occupy the host's default 5432. Update CAREVAULT_PG accordingly.
+      - "5433:5432"
+    volumes:
+      # Postgres 18+ expects the mount at /var/lib/postgresql (parent);
+      # the image manages the versioned data subdir itself.
+      - pg_data:/var/lib/postgresql
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carevault -d carevault"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pg_data:

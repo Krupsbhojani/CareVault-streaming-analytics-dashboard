@@ -1,0 +1,5 @@
+tick_sec,target_rows_min,duration_sec,wall_elapsed,rows_inserted,achieved_rows_min,batches,mean_rows_per_batch,copy_ms_p50,copy_ms_p95,insert_ms_p50,insert_ms_p95,sleep_ms_p50,e2e_latency_p95_ms,worker_lag_sec_end
+0.5,5000,300,428.3,24621,3449,340,72.8,97.86,114.76,51.40,72.90,500,,
+1.0,5000,300,436.1,24597,3384,213,116.0,98.85,116.11,53.77,88.21,1000,,
+2.0,5000,300,436.0,24617,3388,123,201.1,104.98,131.02,60.54,130.52,2000,,
+4.0,5000,300,432.1,24566,3411,67,368.4,114.73,251.65,78.70,166.82,4000,,

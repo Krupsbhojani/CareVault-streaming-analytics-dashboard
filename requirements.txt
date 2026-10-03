@@ -1,0 +1,14 @@
+# CareVault dashboard — Azure App Service deps.
+# Dashboard-only. The replayer and processor have their own (numpy, etc.) and
+# are NOT required to serve the dashboard.
+#
+# Pins match the versions verified locally on 2026-10-03.
+
+streamlit==1.63.0
+pandas==2.3.3
+altair==6.0.0
+
+# psycopg 3 (not psycopg2). The [binary] extra ships the libpq wheel so the
+# App Service image doesn't need libpq-dev at build time.
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
