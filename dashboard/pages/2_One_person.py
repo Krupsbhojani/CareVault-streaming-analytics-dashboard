@@ -219,17 +219,84 @@ def _fetch_cgm_series(vp: str, minutes: int = 180) -> pd.DataFrame:
     return df
 
 
-def _fetch_predictions(vp: str) -> pd.DataFrame:
-    return timed_query("op_predictions", """
-        SELECT predicted_ts_utc AS ts,
-               predicted_cgm_mgdl AS cgm,
-               predicted_low AS lo,
-               predicted_high AS hi
+# The dashboard reads the persistence model (naive "next reading = current
+# reading"). It wins the recent-error leaderboard against linear_trend,
+# river_linreg and river_ht in this project — see processor/ml.py.
+MODEL_NAME = "persistence"
+
+
+def _fetch_latest_forecast(vp: str) -> pd.DataFrame:
+    """The newest persistence prediction whose target time is still in the
+    future (event-time). Used by the top card and the chart layer."""
+    return timed_query("op_forecast", """
+        SELECT predicted_ts_utc    AS ts,
+               predicted_cgm_mgdl  AS cgm,
+               input_window_end    AS from_ts,
+               horizon_seconds     AS horizon_src_sec,
+               emitted_at          AS emitted_at
           FROM live.predictions
          WHERE virtual_patient_id = %s
+           AND model_name = %s
            AND predicted_ts_utc > now()
-         ORDER BY predicted_ts_utc
-         LIMIT 30
+         ORDER BY emitted_at DESC
+         LIMIT 1
+    """, (vp, MODEL_NAME))
+
+
+def _fetch_recent_error(vp: str) -> pd.DataFrame:
+    """Person's recent typical error (median of |predicted - actual|) over
+    the last hour of resolved predictions, plus a count of how many data
+    points fed it. Fallback to the global persistence error if this person
+    hasn't accumulated enough resolved predictions yet."""
+    return timed_query("op_recent_error", """
+        WITH mine AS (
+            SELECT abs_error_mgdl
+              FROM live.predictions
+             WHERE virtual_patient_id = %s
+               AND model_name = %s
+               AND resolved_at IS NOT NULL
+               AND resolved_at > now() - interval '60 minutes'
+        ),
+        global_tail AS (
+            SELECT abs_error_mgdl
+              FROM live.predictions
+             WHERE model_name = %s
+               AND resolved_at IS NOT NULL
+               AND resolved_at > now() - interval '15 minutes'
+        )
+        SELECT
+          (SELECT count(*) FROM mine)                                        AS n_mine,
+          (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY abs_error_mgdl)
+             FROM mine)                                                       AS p50_mine,
+          (SELECT count(*) FROM global_tail)                                  AS n_global,
+          (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY abs_error_mgdl)
+             FROM global_tail)                                                AS p50_global
+    """, (vp, MODEL_NAME, MODEL_NAME))
+
+
+def _fetch_model_leaderboard() -> pd.DataFrame:
+    """Per-model typical error over the last 15 min of resolved predictions.
+    Lets the right-column card say 'the fancier model is X worse per guess'."""
+    return timed_query("op_model_leaderboard", """
+        SELECT model_name,
+               count(*)                                                       AS n,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY abs_error_mgdl)    AS p50
+          FROM live.predictions
+         WHERE resolved_at IS NOT NULL
+           AND resolved_at > now() - interval '15 minutes'
+         GROUP BY model_name
+         ORDER BY p50
+    """)
+
+
+def _fetch_vp_reading_count(vp: str) -> pd.DataFrame:
+    """How many readings we've received for this person — honest denominator
+    for the "learned from" row (persistence doesn't 'learn', but this is the
+    data the system has gathered so far)."""
+    return timed_query("op_reading_count", """
+        SELECT count(*) AS n
+          FROM live.vitals_readings
+         WHERE virtual_patient_id = %s
     """, (vp,))
 
 
@@ -300,28 +367,49 @@ def top_card_fragment() -> None:
     s = build_situation(row)
     sev_color = SEVERITY_COLOR.get(s.severity, TEXT_PRIMARY)
 
-    # Forecast slot
-    fx = _fetch_predictions(selected_vp)
+    # Forecast slot (persistence model, 15-min source-time horizon).
+    fx = _fetch_latest_forecast(selected_vp)
+    err = _fetch_recent_error(selected_vp)
+    typical_err: float | None = None
+    err_source = "none"
+    if not err.empty:
+        r = err.iloc[0]
+        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+            typical_err = float(r["p50_mine"]); err_source = "mine"
+        elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
+            typical_err = float(r["p50_global"]); err_source = "global"
+
     if fx.empty:
+        n_readings = _fetch_vp_reading_count(selected_vp)
+        n = int(n_readings.iloc[0]["n"]) if not n_readings.empty else 0
+        # Forecast lands at: input_window_end + horizon_source_seconds / speed.
+        # Explain how far off the first forecast is in plain terms.
+        if n == 0:
+            msg = "The system has not seen a reading from this person yet."
+        else:
+            # Guess: the next persistence forecast fires on the next incoming
+            # reading, which is one sampling cycle away in source time.
+            msg = (f"Gathered {n:,} readings so far. The first forecast appears "
+                   f"once the system has one full window — a minute or so after "
+                   f"the next reading arrives.")
         forecast_html = (
             '<div style="border-left:1px solid #ECEFEE; padding-left:16px; '
-            'min-width:200px;">'
+            'min-width:220px;">'
             '<div class="small-caps">where it is heading in 15 minutes</div>'
-            '<div class="mid-value t-muted" style="margin-top:6px;">not built yet</div>'
-            '<div style="font-size:12px; color:#5C6A70; margin-top:4px;">'
-            'The prediction model is still being developed.</div>'
+            '<div class="mid-value t-muted" style="margin-top:6px;">gathering readings</div>'
+            f'<div style="font-size:12px; color:#5C6A70; margin-top:4px;">{msg}</div>'
             '</div>'
         )
     else:
-        # Take the ~15-minute-out row.
-        first = fx.iloc[min(len(fx) - 1, 2)]  # roughly 3rd point (~15 min if 5-min)
-        v = float(first["cgm"]) if first["cgm"] is not None else None
-        lo, hi = first.get("lo"), first.get("hi")
-        pm = None
-        if lo is not None and hi is not None and v is not None:
-            pm = (float(hi) - float(lo)) / 2.0
+        f = fx.iloc[0]
+        v = float(f["cgm"]) if f["cgm"] is not None else None
         v_txt = f"{int(round(v))}" if v is not None else "—"
-        pm_txt = f"give or take {int(round(pm))}" if pm else "give or take —"
+        # Give-or-take: use the model's recent typical error. No MAE/RMSE on
+        # screen — plain "give or take N mg/dL".
+        if typical_err is not None:
+            pm_txt = f"give or take {int(round(typical_err))} mg/dL"
+        else:
+            pm_txt = "give or take — (not enough resolved predictions yet)"
         forecast_html = (
             '<div style="border-left:1px solid #ECEFEE; padding-left:16px;">'
             '<div class="small-caps">where it is heading in 15 minutes</div>'
@@ -472,24 +560,58 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
         ).encode(x="ts:T", y="cgm:Q")
         layers.append(latest_marker)
 
+    # Forecast layer: dashed line + shaded band stretching from the current
+    # reading to the predicted point. The forecast DataFrame carries two rows
+    # (now, predicted_ts_utc) built in chart_fragment, with the band as
+    # (cgm ± typical_error).
     if not forecast.empty:
         fdash = alt.Chart(forecast).mark_line(
             color=EMERGENCY, strokeDash=[4, 3], strokeWidth=2,
         ).encode(x="ts:T", y="cgm:Q")
-        if "lo" in forecast.columns and "hi" in forecast.columns:
+        if "lo" in forecast.columns and "hi" in forecast.columns \
+                and forecast["lo"].notna().any():
             band = alt.Chart(forecast).mark_area(color=EMERGENCY, opacity=0.14).encode(
                 x="ts:T", y="lo:Q", y2="hi:Q",
             )
             layers.append(band)
         layers.append(fdash)
+        # A small ring on the predicted point so the reader sees where the
+        # forecast lands exactly.
+        tip = forecast.iloc[[-1]].copy()
+        tip_marker = alt.Chart(tip).mark_point(
+            shape="circle", size=90, filled=False, color=EMERGENCY, strokeWidth=2,
+        ).encode(x="ts:T", y="cgm:Q")
+        layers.append(tip_marker)
 
     return alt.layer(*layers).properties(height=330).configure_view(strokeOpacity=0)
+
+
+def _build_forecast_frame(cgm: pd.DataFrame, fx: pd.DataFrame,
+                          typical_err: float | None) -> pd.DataFrame:
+    """Shape the forecast rows the chart wants: two rows connecting the
+    latest actual reading to the predicted point, with lo/hi bounds derived
+    from the model's recent typical error."""
+    if fx.empty or cgm.empty:
+        return pd.DataFrame(columns=["ts", "cgm", "lo", "hi"])
+    f = fx.iloc[0]
+    tail = cgm.iloc[-1]
+    pred_cgm = float(f["cgm"]) if f["cgm"] is not None else None
+    if pred_cgm is None:
+        return pd.DataFrame(columns=["ts", "cgm", "lo", "hi"])
+    err = float(typical_err) if typical_err is not None else None
+    pred_lo = pred_cgm - err if err is not None else None
+    pred_hi = pred_cgm + err if err is not None else None
+    anchor_lo = float(tail["cgm"]) if err is None else float(tail["cgm"])
+    anchor_hi = float(tail["cgm"]) if err is None else float(tail["cgm"])
+    return pd.DataFrame([
+        {"ts": tail["ts"],  "cgm": float(tail["cgm"]), "lo": anchor_lo, "hi": anchor_hi},
+        {"ts": f["ts"],     "cgm": pred_cgm,            "lo": pred_lo,  "hi": pred_hi},
+    ])
 
 
 @st.fragment(run_every="5s", parallel=True)
 def chart_fragment() -> None:
     cgm = _fetch_cgm_series(selected_vp, minutes=180)
-    fx = _fetch_predictions(selected_vp)
     if cgm.empty:
         st.markdown(
             '<div class="card"><h3>Waiting for the first hour of readings</h3>'
@@ -497,9 +619,19 @@ def chart_fragment() -> None:
             unsafe_allow_html=True,
         )
         return
+    fx = _fetch_latest_forecast(selected_vp)
+    err_df = _fetch_recent_error(selected_vp)
+    typical_err = None
+    if not err_df.empty:
+        r = err_df.iloc[0]
+        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+            typical_err = float(r["p50_mine"])
+        elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
+            typical_err = float(r["p50_global"])
+    forecast_df = _build_forecast_frame(cgm, fx, typical_err)
     st.markdown('<div class="card" style="padding:12px 12px 4px 12px;">',
                 unsafe_allow_html=True)
-    st.altair_chart(_build_cgm_chart(cgm, fx), width='stretch')
+    st.altair_chart(_build_cgm_chart(cgm, forecast_df), width='stretch')
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -791,20 +923,84 @@ def events_card() -> None:
     )
 
 
+def _val_or_pending(text: str, muted: bool = False) -> str:
+    """Right-aligned grid cell with mono font."""
+    cls = "mono t-muted" if muted else "mono"
+    return f'<span class="{cls}" style="text-align:right;">{text}</span>'
+
+
+@st.fragment(run_every="10s", parallel=True)
 def prediction_card() -> None:
+    """Fill the three rows with real numbers in plain English.
+
+    Row 1 — typical error.  "About N mg/dL off, half the time" using the
+            person's own resolved predictions (or the fleet's recent ones
+            if the person hasn't accumulated enough).
+    Row 2 — how it compares with the simple last-value guess.
+            The dashboard uses persistence, which IS the last-value guess.
+            Row shows how much the next-best model would cost per guess.
+    Row 3 — readings on file (what the system has gathered for this person).
+    """
+    err_df = _fetch_recent_error(selected_vp)
+    board  = _fetch_model_leaderboard()
+    nread  = _fetch_vp_reading_count(selected_vp)
+
+    # ---- row 1
+    row1 = "<em>still gathering readings</em>"
+    err_scope = ""
+    if not err_df.empty:
+        r = err_df.iloc[0]
+        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+            row1 = f"about {int(round(float(r['p50_mine'])))} mg/dL off, half the time"
+            err_scope = f"from this person's last {int(r['n_mine'])} resolved guesses"
+        elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
+            row1 = f"about {int(round(float(r['p50_global'])))} mg/dL off, half the time"
+            err_scope = f"fleet-wide ({int(r['n_global'])} recent resolved guesses)"
+
+    # ---- row 2: compare persistence (what we show) with the next-best other model
+    row2 = "<em>no comparison yet</em>"
+    if not board.empty:
+        persistence_rows = board[board["model_name"] == MODEL_NAME]
+        others           = board[board["model_name"] != MODEL_NAME]
+        if not persistence_rows.empty and not others.empty:
+            p_err = float(persistence_rows.iloc[0]["p50"])
+            o_err = float(others.iloc[0]["p50"])      # others is already sorted asc
+            o_name = str(others.iloc[0]["model_name"])
+            name_plain = {
+                "linear_trend": "a straight-line trend",
+                "river_linreg": "an online linear model",
+                "river_ht":     "an online decision tree",
+            }.get(o_name, o_name)
+            diff = o_err - p_err
+            if diff > 0.5:
+                row2 = (f"this simple guess beats {name_plain} by "
+                        f"{int(round(diff))} mg/dL per prediction")
+            elif diff < -0.5:
+                row2 = (f"{name_plain} is {int(round(-diff))} mg/dL per prediction "
+                        f"better; the simple guess is still what's shown")
+            else:
+                row2 = (f"{name_plain} is within 1 mg/dL of this simple guess — "
+                        f"close call")
+
+    # ---- row 3: readings on file
+    n_readings = int(nread.iloc[0]["n"]) if not nread.empty else 0
+    row3 = f"{n_readings:,} readings on file" if n_readings else "no readings yet"
+
     st.markdown(
         '<div class="card">'
         '<h4>the prediction</h4>'
-        '<p>The prediction model learns from every reading this person '
-        'produces. It will show its best guess for the next 15 minutes '
-        'once training is complete.</p>'
-        '<div style="display:grid; grid-template-columns:1fr auto; gap:6px 12px; '
+        '<p>The forecast uses the simplest honest rule: "the number in 15 minutes '
+        'will be what it is now." Three other models run in parallel and the '
+        'system shows whichever is winning on recent accuracy.</p>'
+        '<div style="display:grid; grid-template-columns:1fr auto; gap:8px 12px; '
         'margin-top:10px; font-size:13px; color:#5C6A70;">'
-        '<span>Predicted value in 15 minutes</span><span class="mono t-muted">[TO FILL]</span>'
-        '<span>Confidence range</span><span class="mono t-muted">[TO FILL]</span>'
-        '<span>How often the model has been right</span><span class="mono t-muted">[TO FILL]</span>'
+        f'<span>Typical error, lately</span>{_val_or_pending(row1)}'
+        f'<span>vs. a fancier model</span>{_val_or_pending(row2)}'
+        f'<span>What the system has gathered</span>{_val_or_pending(row3)}'
         '</div>'
-        '</div>',
+        + (f'<div style="font-size:11px; color:#8B9499; margin-top:8px;">'
+           f'Typical-error source: {err_scope}.</div>' if err_scope else '')
+        + '</div>',
         unsafe_allow_html=True,
     )
 
