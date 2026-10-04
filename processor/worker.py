@@ -43,6 +43,17 @@ OVERLAP_SEC     = 10        # re-scan window to catch late arrivals
 POLL_TIMEOUT_S  = 2.0       # 2s fallback when no NOTIFY arrives
 FETCH_LIMIT     = 5_000     # per fetch cycle
 NOTIFY_CHANNEL  = "vitals_new"
+# Lexically smallest text — safe default for an unseeded composite cursor,
+# so (now, "") < (now, any real vp_id) and the first vp at a given ingested_at
+# is reachable on first run.
+_SENTINEL_VP    = ""
+
+# Cursor is a composite (last_ingested_at, last_virtual_patient_id). The
+# vp_id tiebreaker exists so a chunk of FETCH_LIMIT rows that share an
+# ingested_at value can never stall the cursor at the boundary — the fetch
+# advances through the chunk vp-by-vp, deterministically, instead of
+# repeatedly re-reading the same rows (observed stall on Azure 2026-10-03/04).
+Cursor = tuple[datetime, str]
 
 # Columns we actually SELECT. Notably absent: injected_type.
 _FETCH_COLS = (
@@ -68,14 +79,18 @@ def _worker_id(shard: int, num_shards: int) -> str:
     return f"proc:{shard}/{num_shards}"
 
 
-def _load_cursor(conn, worker_id: str) -> datetime:
-    """Return the last_ingested_at cursor (or a very old timestamp on first run)."""
+def _load_cursor(conn, worker_id: str) -> Cursor:
+    """Return the composite (last_ingested_at, last_virtual_patient_id) cursor,
+    or a very-old / empty sentinel on first run."""
     with conn.cursor() as cur:
-        cur.execute("SELECT last_ingested_at FROM live.worker_cursor WHERE worker_id = %s", (worker_id,))
+        cur.execute("""
+            SELECT last_ingested_at, last_virtual_patient_id
+              FROM live.worker_cursor WHERE worker_id = %s
+        """, (worker_id,))
         row = cur.fetchone()
-    if row and row[0]:
-        return row[0]
-    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if row and row[0] is not None:
+        return (row[0], row[1] or _SENTINEL_VP)
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc), _SENTINEL_VP)
 
 
 def _load_vp_state(conn, worker_id: str) -> dict[str, datetime]:
@@ -112,42 +127,56 @@ def _prewarm_detector(conn, detector: Detector, vp_last_ts: dict[str, datetime])
 
 # ---------------- fetch + process ----------------
 
-def _fetch_batch(conn, shard: int, num_shards: int, cursor: datetime,
-                 vp_last_ts: dict[str, datetime]) -> tuple[list[Reading], datetime, int]:
+def _fetch_batch(conn, shard: int, num_shards: int, cursor: Cursor,
+                 vp_last_ts: dict[str, datetime]) -> tuple[list[Reading], Cursor, int]:
     """Read the next batch of rows for this shard, with a 10s overlap window.
     Per-vp dedup happens in Python after the SQL fetch.
 
-    Returns (kept_rows, sql_max_ingested_at, sql_row_count).
-    sql_max_ingested_at must be used to advance the cursor even when
-    kept_rows is empty (all rows were dupes) — otherwise the cursor stays
-    put and the next fetch returns the same rows again, forever.
+    Composite seek: rows beyond the cursor are selected by lexicographic
+    (ingested_at, virtual_patient_id) comparison. Rows strictly inside the
+    overlap window (ingested_at < cursor_ia AND ingested_at > cursor_ia-10s)
+    are also fetched for late-arrival catch-up. ORDER BY matches the composite
+    so a next cycle resumes exactly where this one stopped.
+
+    Returns (kept_rows, sql_max_cursor, sql_row_count).
+    sql_max_cursor is the max composite seen in the SQL rows (bounded below by
+    the current cursor). It is used to advance even when kept_rows is empty
+    (all rows were per-vp dupes) — otherwise the cursor stays put and the next
+    fetch returns the same rows again, forever.
     """
-    lower = cursor - timedelta(seconds=OVERLAP_SEC)
+    cursor_ia, cursor_vp = cursor
+    lower = cursor_ia - timedelta(seconds=OVERLAP_SEC)
     q = f"""
         SELECT {', '.join(_FETCH_COLS)}
           FROM live.vitals_readings
          WHERE mod(abs(hashtext(virtual_patient_id)), %s) = %s
            AND ingested_at > %s
-         ORDER BY ingested_at
+           AND (
+             ingested_at < %s
+             OR (ingested_at, virtual_patient_id) > (%s, %s)
+           )
+         ORDER BY ingested_at, virtual_patient_id
          LIMIT %s
     """
     with conn.cursor() as cur:
-        cur.execute(q, (num_shards, shard, lower, FETCH_LIMIT))
+        cur.execute(q, (num_shards, shard, lower,
+                        cursor_ia, cursor_ia, cursor_vp, FETCH_LIMIT))
         rows = cur.fetchall()
 
-    sql_max_ingested = cursor
+    sql_max_ia, sql_max_vp = cursor_ia, cursor_vp
     out: list[Reading] = []
     for row in rows:
         r = Reading(*row)
-        if r.ingested_at > sql_max_ingested:
-            sql_max_ingested = r.ingested_at
+        key = (r.ingested_at, r.virtual_patient_id)
+        if key > (sql_max_ia, sql_max_vp):
+            sql_max_ia, sql_max_vp = key
         prev = vp_last_ts.get(r.virtual_patient_id)
         if prev is not None and r.event_time <= prev:
-            continue  # already processed
+            continue  # already processed per vp_last_ts
         out.append(r)
     # Keep chronological within vp for MAD determinism.
     out.sort(key=lambda r: (r.virtual_patient_id, r.event_time))
-    return out, sql_max_ingested, len(rows)
+    return out, (sql_max_ia, sql_max_vp), len(rows)
 
 
 def _upsert_1min_rollups(cur, affected_minutes: set[tuple[str, datetime]]) -> None:
@@ -217,7 +246,7 @@ def _upsert_1min_rollups(cur, affected_minutes: set[tuple[str, datetime]]) -> No
 
 
 def _commit_batch(conn, worker_id: str, alerts: list[Alert],
-                  vp_advance: dict[str, datetime], new_cursor: datetime,
+                  vp_advance: dict[str, datetime], new_cursor: Cursor,
                   affected_minutes: set[tuple[str, datetime]] | None = None,
                   prediction_inserts: list[tuple] | None = None,
                   prediction_resolutions: list[tuple] | None = None) -> None:
@@ -246,13 +275,19 @@ def _commit_batch(conn, worker_id: str, alerts: list[Alert],
                        SET last_event_time = GREATEST(worker_state.last_event_time, EXCLUDED.last_event_time),
                            updated_at      = now()
                 """, [(worker_id, vp, ts) for vp, ts in vp_advance.items()])
+            # Row-wise comparison in the WHERE prevents cursor regression if
+            # the current row is already past the one we're trying to write.
             cur.execute("""
-                INSERT INTO live.worker_cursor (worker_id, last_ingested_at)
-                VALUES (%s, %s)
+                INSERT INTO live.worker_cursor
+                    (worker_id, last_ingested_at, last_virtual_patient_id)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (worker_id) DO UPDATE
-                   SET last_ingested_at = GREATEST(worker_cursor.last_ingested_at, EXCLUDED.last_ingested_at),
-                       updated_at       = now()
-            """, (worker_id, new_cursor))
+                   SET last_ingested_at        = EXCLUDED.last_ingested_at,
+                       last_virtual_patient_id = EXCLUDED.last_virtual_patient_id,
+                       updated_at              = now()
+                 WHERE (EXCLUDED.last_ingested_at, EXCLUDED.last_virtual_patient_id)
+                     > (worker_cursor.last_ingested_at, worker_cursor.last_virtual_patient_id)
+            """, (worker_id, new_cursor[0], new_cursor[1]))
             _upsert_1min_rollups(cur, affected_minutes or set())
             _write_predictions(cur, prediction_inserts, prediction_resolutions)
 
@@ -311,18 +346,31 @@ def _drain_pending_notifies(conn) -> int:
 
 
 def process_one_cycle(conn, detector: Detector, shard: int, num_shards: int,
-                      cursor: datetime, vp_last_ts: dict[str, datetime],
+                      cursor: Cursor, vp_last_ts: dict[str, datetime],
                       ml: MlPipeline | None = None
-                      ) -> tuple[int, int, datetime, int]:
+                      ) -> tuple[int, int, Cursor, int]:
     """One fetch+process+commit cycle.
     Returns (rows_processed, alerts_emitted, new_cursor, sql_rows_fetched).
     ML predictions (when `ml` is provided) are written inside the same
     transaction as alerts + cursor.
     """
     worker_id = _worker_id(shard, num_shards)
-    rows, sql_max_ingested, sql_count = _fetch_batch(conn, shard, num_shards, cursor, vp_last_ts)
+    rows, sql_max_cursor, sql_count = _fetch_batch(conn, shard, num_shards, cursor, vp_last_ts)
     if sql_count == 0:
         return (0, 0, cursor, 0)
+
+    # Loud stall signature: SQL filled the LIMIT but every row was per-vp
+    # dedup'd. With the composite cursor the next cycle will advance via
+    # sql_max_cursor; without the composite key (the Azure incident) it
+    # couldn't. Log noisily so the pattern is never silent again.
+    if sql_count >= FETCH_LIMIT and not rows:
+        print(f"[worker] WARNING: fetched FETCH_LIMIT={FETCH_LIMIT} rows and "
+              f"kept 0 after vp_last_ts dedup. cursor_before={cursor}, "
+              f"sql_max={sql_max_cursor}, vp_last_ts_size={len(vp_last_ts)}. "
+              f"Composite cursor should advance; if this persists, the fetch "
+              f"is pinned at a boundary — check live.worker_cursor.",
+              file=sys.stderr, flush=True)
+
     alerts: list[Alert] = []
     vp_advance: dict[str, datetime] = {}
     affected_minutes: set[tuple[str, datetime]] = set()
@@ -347,8 +395,13 @@ def process_one_cycle(conn, detector: Detector, shard: int, num_shards: int,
                         and a.trigger_event_time == r.event_time}
             ml.process_reading(r, rule_ids)
 
+    # Clamp future ingested_at so a single late-arrival row with
+    # ingested_at > wall-clock can't strand real-time rows behind it.
     now = datetime.now(timezone.utc)
-    new_cursor = min(sql_max_ingested, now)
+    new_ia, new_vp = sql_max_cursor
+    if new_ia > now:
+        new_ia, new_vp = now, _SENTINEL_VP
+    new_cursor: Cursor = (new_ia, new_vp)
 
     ml_inserts, ml_resolutions = ([], [])
     if ml is not None:
@@ -456,9 +509,12 @@ def run(conninfo: str, shard: int, num_shards: int,
                 )
                 dt = time.monotonic() - t0
                 if log_file:
-                    log_file.write(f"{stats['cycles']}\t{cursor_before.isoformat()}\t"
+                    cb_ia, cb_vp = cursor_before
+                    ca_ia, ca_vp = cursor
+                    log_file.write(f"{stats['cycles']}\t{cb_ia.isoformat()}|{cb_vp}\t"
                                    f"{sql_count}\t{n_rows}\t{n_alerts}\t"
-                                   f"{cursor.isoformat()}\t{cursor.isoformat()}\t"
+                                   f"{ca_ia.isoformat()}|{ca_vp}\t"
+                                   f"{ca_ia.isoformat()}|{ca_vp}\t"
                                    f"{len(vp_last_ts)}\t{notifies_drained}\t{dt*1000:.1f}\n")
                 stats["cycles"] += 1
                 stats["rows"] += n_rows

@@ -226,19 +226,31 @@ MODEL_NAME = "persistence"
 
 
 def _fetch_latest_forecast(vp: str) -> pd.DataFrame:
-    """The newest persistence prediction whose target time is still in the
-    future (event-time). Used by the top card and the chart layer."""
+    """The newest persistence prediction for this vp, ranked by the reading
+    it was made from (input_window_end). No future-vs-now() filter — both
+    predicted_ts_utc and input_window_end are in event-time, which trails
+    wall-clock under replay (and would never be > now() in that case).
+
+    Also returns the actual CGM at the input_window_end so the chart can
+    anchor the dashed line to that reading, not to 'wall clock now'.
+    """
     return timed_query("op_forecast", """
-        SELECT predicted_ts_utc    AS ts,
-               predicted_cgm_mgdl  AS cgm,
-               input_window_end    AS from_ts,
-               horizon_seconds     AS horizon_src_sec,
-               emitted_at          AS emitted_at
-          FROM live.predictions
-         WHERE virtual_patient_id = %s
-           AND model_name = %s
-           AND predicted_ts_utc > now()
-         ORDER BY emitted_at DESC
+        SELECT p.predicted_ts_utc   AS ts,
+               p.predicted_cgm_mgdl AS cgm,
+               p.input_window_end   AS from_ts,
+               p.horizon_seconds    AS horizon_src_sec,
+               p.emitted_at         AS emitted_at,
+               -- Actual reading taken at input_window_end — the forecast's
+               -- anchor point. Looked up via the (vp, event_time) unique
+               -- index on vitals_readings so this is a single index seek.
+               (SELECT cgm_mgdl FROM live.vitals_readings
+                  WHERE virtual_patient_id = p.virtual_patient_id
+                    AND event_time         = p.input_window_end
+                  LIMIT 1)          AS from_cgm
+          FROM live.predictions p
+         WHERE p.virtual_patient_id = %s
+           AND p.model_name = %s
+         ORDER BY p.input_window_end DESC
          LIMIT 1
     """, (vp, MODEL_NAME))
 
@@ -382,20 +394,15 @@ def top_card_fragment() -> None:
     if fx.empty:
         n_readings = _fetch_vp_reading_count(selected_vp)
         n = int(n_readings.iloc[0]["n"]) if not n_readings.empty else 0
-        # Forecast lands at: input_window_end + horizon_source_seconds / speed.
-        # Explain how far off the first forecast is in plain terms.
         if n == 0:
             msg = "The system has not seen a reading from this person yet."
         else:
-            # Guess: the next persistence forecast fires on the next incoming
-            # reading, which is one sampling cycle away in source time.
             msg = (f"Gathered {n:,} readings so far. The first forecast appears "
-                   f"once the system has one full window — a minute or so after "
-                   f"the next reading arrives.")
+                   f"after the system has one full window of history.")
         forecast_html = (
             '<div style="border-left:1px solid #ECEFEE; padding-left:16px; '
             'min-width:220px;">'
-            '<div class="small-caps">where it is heading in 15 minutes</div>'
+            '<div class="small-caps">forecast</div>'
             '<div class="mid-value t-muted" style="margin-top:6px;">gathering readings</div>'
             f'<div style="font-size:12px; color:#5C6A70; margin-top:4px;">{msg}</div>'
             '</div>'
@@ -404,17 +411,30 @@ def top_card_fragment() -> None:
         f = fx.iloc[0]
         v = float(f["cgm"]) if f["cgm"] is not None else None
         v_txt = f"{int(round(v))}" if v is not None else "—"
-        # Give-or-take: use the model's recent typical error. No MAE/RMSE on
-        # screen — plain "give or take N mg/dL".
+        # Horizon in plain source-minutes. 'horizon_src_sec' is the source-time
+        # horizon the model was configured with (900 s = 15 min at the data's
+        # own clock). Independent of replay speed, independent of lag.
+        horizon_min = int(round(float(f["horizon_src_sec"]) / 60.0)) if f["horizon_src_sec"] else 15
+        # Timestamp of the reading the forecast was made from. Shown as the
+        # 'from' clock, so the operator sees forecast is anchored to the data,
+        # not to wall-clock now().
+        from_ts = f["from_ts"]
+        try:
+            from_hhmm = from_ts.strftime("%-I:%M %p")
+        except (ValueError, TypeError, AttributeError):
+            from_hhmm = from_ts.strftime("%H:%M") if from_ts is not None else "—"
         if typical_err is not None:
             pm_txt = f"give or take {int(round(typical_err))} mg/dL"
         else:
             pm_txt = "give or take — (not enough resolved predictions yet)"
         forecast_html = (
             '<div style="border-left:1px solid #ECEFEE; padding-left:16px;">'
-            '<div class="small-caps">where it is heading in 15 minutes</div>'
+            '<div class="small-caps">forecast</div>'
             f'<div class="mid-value" style="margin-top:6px; color:{sev_color};">{v_txt}</div>'
             f'<div style="font-size:12px; color:#5C6A70; margin-top:4px;">{pm_txt}</div>'
+            f'<div style="font-size:11px; color:#8B9499; margin-top:4px;">'
+            f'{horizon_min} min ahead of the reading at '
+            f'<span class="mono">{from_hhmm}</span></div>'
             '</div>'
         )
 
@@ -474,9 +494,16 @@ top_card_fragment()
 def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
     now = datetime.now(timezone.utc)
     # Keep the domain at 3 hours so the chart doesn't change scale as data
-    # arrives. If less data is available it just fills the right side.
+    # arrives. The right edge extends to include the forecast point if it
+    # lands past 'now' (keep-up case) or to leave a 20 min margin otherwise.
     x_lo = now - timedelta(hours=3)
-    x_hi = now + (timedelta(minutes=20) if not forecast.empty else timedelta(minutes=0))
+    x_hi = now
+    if not forecast.empty:
+        forecast_ts_max = pd.to_datetime(forecast["ts"]).max()
+        if forecast_ts_max.tzinfo is None:
+            forecast_ts_max = forecast_ts_max.tz_localize("UTC")
+        forecast_ts_max = forecast_ts_max.to_pydatetime()
+        x_hi = max(x_hi, forecast_ts_max) + timedelta(minutes=5)
     x_scale = alt.Scale(domain=[x_lo, x_hi])
     y_scale = alt.Scale(domain=[40, 300])
 
@@ -588,24 +615,43 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
 
 def _build_forecast_frame(cgm: pd.DataFrame, fx: pd.DataFrame,
                           typical_err: float | None) -> pd.DataFrame:
-    """Shape the forecast rows the chart wants: two rows connecting the
-    latest actual reading to the predicted point, with lo/hi bounds derived
-    from the model's recent typical error."""
-    if fx.empty or cgm.empty:
+    """Shape the forecast rows the chart wants.
+
+    The forecast is anchored to the reading it was made from
+    (input_window_end), NOT to 'the latest reading'. Under lag those can
+    be different — some readings may arrive before the ML pipeline has
+    scored them. Drawing from the latest reading would show a line going
+    sideways-or-backward, which is wrong.
+
+    Returns two rows: (input_window_end, cgm_at_that_reading) → (predicted_ts_utc, predicted_cgm).
+    If the actual CGM at input_window_end couldn't be read (very rare), we
+    fall back to the latest cgm in the series so the chart still has an
+    anchor to draw from.
+    """
+    if fx.empty:
         return pd.DataFrame(columns=["ts", "cgm", "lo", "hi"])
     f = fx.iloc[0]
-    tail = cgm.iloc[-1]
     pred_cgm = float(f["cgm"]) if f["cgm"] is not None else None
     if pred_cgm is None:
         return pd.DataFrame(columns=["ts", "cgm", "lo", "hi"])
+    # Anchor point: (from_ts, from_cgm) if the actual reading is available,
+    # otherwise the latest cgm series point.
+    from_ts = f["from_ts"]
+    from_cgm = f.get("from_cgm")
+    if from_cgm is None or pd.isna(from_cgm):
+        if cgm.empty:
+            return pd.DataFrame(columns=["ts", "cgm", "lo", "hi"])
+        tail = cgm.iloc[-1]
+        from_ts = tail["ts"]
+        from_cgm = float(tail["cgm"])
+    else:
+        from_cgm = float(from_cgm)
     err = float(typical_err) if typical_err is not None else None
     pred_lo = pred_cgm - err if err is not None else None
     pred_hi = pred_cgm + err if err is not None else None
-    anchor_lo = float(tail["cgm"]) if err is None else float(tail["cgm"])
-    anchor_hi = float(tail["cgm"]) if err is None else float(tail["cgm"])
     return pd.DataFrame([
-        {"ts": tail["ts"],  "cgm": float(tail["cgm"]), "lo": anchor_lo, "hi": anchor_hi},
-        {"ts": f["ts"],     "cgm": pred_cgm,            "lo": pred_lo,  "hi": pred_hi},
+        {"ts": from_ts, "cgm": from_cgm, "lo": from_cgm, "hi": from_cgm},
+        {"ts": f["ts"], "cgm": pred_cgm, "lo": pred_lo,  "hi": pred_hi},
     ])
 
 
@@ -989,9 +1035,11 @@ def prediction_card() -> None:
     st.markdown(
         '<div class="card">'
         '<h4>the prediction</h4>'
-        '<p>The forecast uses the simplest honest rule: "the number in 15 minutes '
-        'will be what it is now." Three other models run in parallel and the '
-        'system shows whichever is winning on recent accuracy.</p>'
+        '<p>The forecast uses the simplest honest rule: "the next reading will '
+        'be the same as this one." It looks 15 minutes ahead of the reading it '
+        'was made from, not 15 minutes from the wall clock. Three other models '
+        'run in parallel and the system shows whichever is winning on recent '
+        'accuracy.</p>'
         '<div style="display:grid; grid-template-columns:1fr auto; gap:8px 12px; '
         'margin-top:10px; font-size:13px; color:#5C6A70;">'
         f'<span>Typical error, lately</span>{_val_or_pending(row1)}'

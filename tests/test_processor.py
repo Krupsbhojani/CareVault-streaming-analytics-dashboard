@@ -29,6 +29,7 @@ from processor.outliers import (  # noqa: E402
 from processor.worker import (  # noqa: E402
     PROCESSOR_CONNINFO_DEFAULT, _worker_id, process_one_cycle, run as worker_run,
 )
+from processor import worker as worker_mod  # noqa: E402  — for monkeypatching FETCH_LIMIT
 
 
 ADMIN_CONNINFO      = os.environ.get("CAREVAULT_PG", CONNINFO_DEFAULT)
@@ -190,17 +191,29 @@ def test_mad_clamp_values_excluded():
 # ============================================================================
 
 @pytest.fixture
-def clean_live_tables(admin_conn):
+def clean_live_tables(admin_conn, monkeypatch):
     """Isolate this test by deleting only test-vp rows / test-worker state.
     Do NOT truncate the full live.vitals_readings table — an evaluation dataset
     may be sitting there (30-min replay for scoring), and destroying it just
-    to run a unit test wastes 10+ minutes of setup."""
+    to run a unit test wastes 10+ minutes of setup.
+
+    Pin the worker_id to a test-only value so a concurrently-running
+    processor (local or azure, both default to proc:0/1) cannot race on
+    our cursor row and advance it past the test's inserted ingested_at.
+    """
+    monkeypatch.setattr(worker_mod, "_worker_id",
+                        lambda shard, num_shards: f"proc:test_restart/{shard}_{num_shards}")
+    test_worker_id = worker_mod._worker_id(0, 1)
     with admin_conn.cursor() as cur:
         cur.execute("DELETE FROM live.vitals_readings WHERE virtual_patient_id LIKE 'vp:test%'")
         cur.execute("DELETE FROM live.alerts          WHERE virtual_patient_id LIKE 'vp:test%'")
-        cur.execute("DELETE FROM live.worker_state    WHERE virtual_patient_id LIKE 'vp:test%'")
-        cur.execute("DELETE FROM live.worker_cursor   WHERE worker_id = 'proc:0/1'")
-    yield
+        cur.execute("DELETE FROM live.worker_state    WHERE worker_id = %s", (test_worker_id,))
+        cur.execute("DELETE FROM live.worker_cursor   WHERE worker_id = %s", (test_worker_id,))
+    yield test_worker_id
+    # Teardown: don't leave the test cursor around.
+    with admin_conn.cursor() as cur:
+        cur.execute("DELETE FROM live.worker_state  WHERE worker_id = %s", (test_worker_id,))
+        cur.execute("DELETE FROM live.worker_cursor WHERE worker_id = %s", (test_worker_id,))
 
 
 def _insert_readings(admin_conn, rows: list[tuple]) -> None:
@@ -236,12 +249,13 @@ def test_restart_safety_exactly_once(admin_conn, proc_conn, clean_live_tables):
         ("vp:test_b", base + timedelta(minutes=10), 55),  # clinical hypo -> alert
     ]
     _insert_readings(admin_conn, rows)
+    test_worker_id = clean_live_tables  # fixture now returns the monkeypatched worker_id
 
     # --- Run 1: one cycle. ---
     # NB: stats1["rows"] counts ALL rows the worker kept (not just test-vp
     # rows), so we don't assert on it when the DB has other data. Instead
     # verify the test rows were processed by checking test-scoped state.
-    worker_run(PROC_CONNINFO, shard=0, num_shards=1, exit_when_idle=True, max_cycles=5)
+    worker_run(PROC_CONNINFO, shard=0, num_shards=1, exit_when_idle=True, max_cycles=50)
 
     # Snapshot alerts (test-scoped) + worker state after run 1.
     with admin_conn.cursor() as cur:
@@ -250,9 +264,9 @@ def test_restart_safety_exactly_once(admin_conn, proc_conn, clean_live_tables):
         cur.execute("""
             SELECT virtual_patient_id, last_event_time
               FROM live.worker_state
-             WHERE virtual_patient_id LIKE 'vp:test%'
+             WHERE worker_id = %s AND virtual_patient_id LIKE 'vp:test%%'
              ORDER BY 1
-        """)
+        """, (test_worker_id,))
         ws_after_run1 = dict(cur.fetchall())
 
     # Verify per-vp cursor advanced past every test reading.
@@ -268,13 +282,16 @@ def test_restart_safety_exactly_once(admin_conn, proc_conn, clean_live_tables):
     old_cursor = rows[0][1] - timedelta(minutes=1)
     with admin_conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO live.worker_cursor (worker_id, last_ingested_at)
-            VALUES (%s, %s)
-            ON CONFLICT (worker_id) DO UPDATE SET last_ingested_at = EXCLUDED.last_ingested_at
-        """, (_worker_id(0, 1), old_cursor))
+            INSERT INTO live.worker_cursor
+                (worker_id, last_ingested_at, last_virtual_patient_id)
+            VALUES (%s, %s, '')
+            ON CONFLICT (worker_id) DO UPDATE
+               SET last_ingested_at        = EXCLUDED.last_ingested_at,
+                   last_virtual_patient_id = EXCLUDED.last_virtual_patient_id
+        """, (test_worker_id, old_cursor))
 
     # --- Run 2: drain until idle. Rows get re-fetched, Python-filter drops dups. ---
-    worker_run(PROC_CONNINFO, shard=0, num_shards=1, exit_when_idle=True, max_cycles=10)
+    worker_run(PROC_CONNINFO, shard=0, num_shards=1, exit_when_idle=True, max_cycles=50)
 
     with admin_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM live.alerts WHERE virtual_patient_id LIKE 'vp:test%'")
@@ -297,16 +314,131 @@ def test_restart_safety_exactly_once(admin_conn, proc_conn, clean_live_tables):
         f"{alerts_after_run1} -> {alerts_after_run2}"
     )
 
-    # Reconciliation: every reading has event_time <= worker_state.last_event_time.
+    # Reconciliation: every test-vp reading has event_time <=
+    # worker_state.last_event_time. Scoped to test vps because other replays
+    # could have left data this test's worker didn't bother to catch up on.
     with admin_conn.cursor() as cur:
         cur.execute("""
             SELECT count(*) FROM live.vitals_readings v
-             WHERE NOT EXISTS (
+             WHERE v.virtual_patient_id LIKE 'vp:test%%'
+               AND NOT EXISTS (
                  SELECT 1 FROM live.worker_state w
                   WHERE w.worker_id = %s
                     AND w.virtual_patient_id = v.virtual_patient_id
                     AND w.last_event_time >= v.event_time
              )
-        """, (_worker_id(0, 1),))
+        """, (test_worker_id,))
         unprocessed = cur.fetchone()[0]
-    assert unprocessed == 0, f"{unprocessed} readings not covered by worker_state cursor"
+    assert unprocessed == 0, f"{unprocessed} test readings not covered by worker_state cursor"
+
+
+# ============================================================================
+# Test 4 — cursor must not stall when > FETCH_LIMIT rows share an ingested_at
+# ============================================================================
+# Reproduces the Azure 2026-10-03/04 incident. Before the composite-key fix,
+# a chunk of FETCH_LIMIT rows at a single ingested_at could deadlock: SQL
+# returned the chunk, per-vp dedup filtered everything, sql_max_ingested
+# equalled the current cursor, GREATEST(cursor, cursor) = cursor, next cycle
+# re-fetched the same chunk, forever. With the composite (ingested_at,
+# virtual_patient_id) seek, sql_max_cursor advances past the tied group.
+
+def test_cursor_advances_past_tied_ingested_at(admin_conn, proc_conn, monkeypatch):
+    """When > FETCH_LIMIT rows share an ingested_at and all are per-vp dupes,
+    the cursor must still make progress on the next fetch."""
+    # Shrink FETCH_LIMIT so a handful of rows is enough to reproduce the
+    # condition. The underlying mechanism (seek pagination at a boundary of
+    # tied ingested_at values) is scale-invariant.
+    monkeypatch.setattr(worker_mod, "FETCH_LIMIT", 5)
+
+    # Unique worker_id so no concurrently-running proc:0/1 worker (if any)
+    # can race on this cursor row.
+    test_worker = "proc:stall_test/1"
+    test_vps = [f"vp:test_stall_{c}" for c in "bcdefg"]  # 6 vps = FETCH_LIMIT+1
+    tied_ia  = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+    future_ia = tied_ia + timedelta(microseconds=723)   # exactly the Azure pattern
+    future_vp = "vp:test_stall_zz_future"
+    cursor_vp_pin = "vp:test_stall_a"  # lexically before all test_vps
+
+    def _cleanup(cur):
+        for vp in test_vps + [future_vp]:
+            cur.execute("DELETE FROM live.vitals_readings WHERE virtual_patient_id = %s", (vp,))
+            cur.execute("DELETE FROM live.alerts          WHERE virtual_patient_id = %s", (vp,))
+        cur.execute("DELETE FROM live.worker_state  WHERE worker_id = %s", (test_worker,))
+        cur.execute("DELETE FROM live.worker_cursor WHERE worker_id = %s", (test_worker,))
+
+    with admin_conn.cursor() as cur:
+        _cleanup(cur)
+        # 6 rows at the same ingested_at, 6 different vps lexically > cursor_vp_pin
+        for vp in test_vps:
+            cur.execute("""
+                INSERT INTO live.vitals_readings
+                    (virtual_patient_id, device_id, event_time, ingested_at, cgm_mgdl,
+                     heart_rate_bpm, systolic_bp_mmhg, diastolic_bp_mmhg, spo2_pct,
+                     injected_type, sampling_sec, source_trace_ref)
+                VALUES (%s, NULL, %s, %s, 110, 70, 118, 76, 97.0, NULL, 300, 'test')
+            """, (vp, tied_ia, tied_ia))
+        # One row microseconds past the tie — the one the OLD code could not reach.
+        cur.execute("""
+            INSERT INTO live.vitals_readings
+                (virtual_patient_id, device_id, event_time, ingested_at, cgm_mgdl,
+                 heart_rate_bpm, systolic_bp_mmhg, diastolic_bp_mmhg, spo2_pct,
+                 injected_type, sampling_sec, source_trace_ref)
+            VALUES (%s, NULL, %s, %s, 110, 70, 118, 76, 97.0, NULL, 300, 'test')
+        """, (future_vp, future_ia, future_ia))
+        # Seed per-vp dedup so every one of the 6 tied rows gets dropped by
+        # the Python filter (reproducing the Azure stall condition exactly).
+        for vp in test_vps:
+            cur.execute("""
+                INSERT INTO live.worker_state (worker_id, virtual_patient_id, last_event_time)
+                VALUES (%s, %s, %s)
+            """, (test_worker, vp, tied_ia))
+        # Pin the cursor at the stall boundary. (ingested_at, vp) comparison
+        # with cursor=(tied_ia, cursor_vp_pin) selects the 6 tied rows (b..g)
+        # plus the future row — but LIMIT=5 cuts off before the future row,
+        # so SQL returns exactly the 5 tied rows b..f. Those all get filtered
+        # by the per-vp dedup → 0 kept. This is the Azure situation.
+        cur.execute("""
+            INSERT INTO live.worker_cursor
+                (worker_id, last_ingested_at, last_virtual_patient_id)
+            VALUES (%s, %s, %s)
+        """, (test_worker, tied_ia, cursor_vp_pin))
+
+    try:
+        cursor0 = worker_mod._load_cursor(proc_conn, test_worker)
+        assert cursor0 == (tied_ia, cursor_vp_pin), f"setup check: {cursor0}"
+        vp_last = worker_mod._load_vp_state(proc_conn, test_worker)
+        assert all(vp in vp_last for vp in test_vps), "setup: vp_last_ts not populated"
+
+        rows, sql_max, sql_count = worker_mod._fetch_batch(
+            proc_conn, 0, 1, cursor0, vp_last
+        )
+        # The stall condition is reproduced:
+        assert sql_count >= worker_mod.FETCH_LIMIT, \
+            f"test setup expected ≥FETCH_LIMIT rows; got sql_count={sql_count}"
+        assert len(rows) == 0, \
+            f"test setup expected 0 kept rows; got {len(rows)} kept"
+
+        # THE FIX: cursor must advance despite 0 kept rows.
+        assert sql_max > cursor0, (
+            f"REGRESSION — composite cursor did not advance past tied ingested_at. "
+            f"before={cursor0}  after={sql_max}  "
+            f"(this is the Azure 2026-10-03/04 stall signature)"
+        )
+
+        # Commit the new cursor and verify the next fetch reaches the future row.
+        worker_mod._commit_batch(proc_conn, test_worker, [], {}, sql_max)
+        cursor1 = worker_mod._load_cursor(proc_conn, test_worker)
+        assert cursor1 == sql_max, f"cursor commit discarded the advance: {cursor1}"
+
+        rows2, sql_max2, sql_count2 = worker_mod._fetch_batch(
+            proc_conn, 0, 1, cursor1, vp_last
+        )
+        future_in_batch = [r for r in rows2 if r.virtual_patient_id == future_vp]
+        assert future_in_batch, (
+            f"REGRESSION — future row at ingested_at > tied is still unreachable "
+            f"after cursor advance. sql_count={sql_count2}, kept={len(rows2)}, "
+            f"cursor_after_advance={cursor1}"
+        )
+    finally:
+        with admin_conn.cursor() as cur:
+            _cleanup(cur)

@@ -231,14 +231,24 @@ CREATE TABLE IF NOT EXISTS live.worker_state (
 );
 
 -- ---------------------------------------------------------------------------
--- worker_cursor: per-worker high-water mark on ingested_at.
--- Used to bound the fetch window efficiently; per-vp dedup via worker_state.
+-- worker_cursor: per-worker high-water mark on (ingested_at, virtual_patient_id).
+-- The virtual_patient_id tiebreaker makes the fetch deterministic even when a
+-- full FETCH_LIMIT chunk shares an ingested_at — otherwise the cursor could
+-- stall at the boundary (observed on Azure 2026-10-03/04 when the step-4
+-- benchmark burst-wrote >FETCH_LIMIT rows into a single overlap window).
+-- Per-vp dedup still happens via live.worker_state.last_event_time.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS live.worker_cursor (
-    worker_id           text        PRIMARY KEY,
-    last_ingested_at    timestamptz NOT NULL,
-    updated_at          timestamptz NOT NULL DEFAULT now()
+    worker_id                   text        PRIMARY KEY,
+    last_ingested_at            timestamptz NOT NULL,
+    last_virtual_patient_id     text        NOT NULL DEFAULT '',
+    updated_at                  timestamptz NOT NULL DEFAULT now()
 );
+-- Backfill for existing databases (idempotent). Default '' is the lexically
+-- smallest text, so an upgraded cursor starts "before" any real vp_id at the
+-- same ingested_at — correct re-entry point.
+ALTER TABLE live.worker_cursor
+    ADD COLUMN IF NOT EXISTS last_virtual_patient_id text NOT NULL DEFAULT '';
 
 -- ---------------------------------------------------------------------------
 -- processor_role: the role the stream processor connects as.

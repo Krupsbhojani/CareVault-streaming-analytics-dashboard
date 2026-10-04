@@ -211,12 +211,16 @@ def build_queries(vp: str) -> dict[str, tuple[str, Any]]:
            AND minute_start_utc > now() - interval '60 minutes'
          ORDER BY minute_start_utc
     """, (vp,))
-    Q["op_predictions"] = ("""
-        SELECT predicted_ts_utc AS ts, predicted_cgm_mgdl AS cgm,
-               predicted_low AS lo, predicted_high AS hi
-          FROM live.predictions
-         WHERE virtual_patient_id = %s AND predicted_ts_utc > now()
-         ORDER BY predicted_ts_utc LIMIT 30
+    Q["op_forecast"] = ("""
+        SELECT p.predicted_ts_utc, p.predicted_cgm_mgdl, p.input_window_end,
+               p.horizon_seconds, p.emitted_at,
+               (SELECT cgm_mgdl FROM live.vitals_readings
+                  WHERE virtual_patient_id = p.virtual_patient_id
+                    AND event_time         = p.input_window_end
+                  LIMIT 1) AS from_cgm
+          FROM live.predictions p
+         WHERE p.virtual_patient_id = %s AND p.model_name = 'persistence'
+         ORDER BY p.input_window_end DESC LIMIT 1
     """, (vp,))
 
     # -------- Page 3 --------
