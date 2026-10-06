@@ -162,24 +162,67 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nResolved predictions/sec (all models): {rate:.1f}  (over {wall_sec:.0f}s wall)")
 
     # ---------- figures ----------
-    # Rolling MAE
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # Rolling MAE — split into two panels so the persistence vs linear_trend
+    # comparison (the one that actually matters) isn't flattened by the River
+    # models' occasional multi-thousand-mg/dL spikes. Top panel shows the
+    # baselines zoomed to a plausible physiologic MAE range; bottom panel
+    # shows the River models on a log scale.
     colors = {"persistence": "#95a5a6", "linear_trend": "#f39c12",
               "river_linreg": "#2874a6", "river_ht": "#186a3b"}
+    BASELINES = ("persistence", "linear_trend")
+    RIVERS    = ("river_linreg", "river_ht")
+
+    rolled_per_model: dict[str, tuple[list[float], list[float]]] = {}
     for name, series in per_model_series.items():
         if not series:
             continue
         abs_errs = [abs(p - a) for p, a in series]
-        rolled = _rolling(abs_errs, ROLLING_WINDOW)
-        # X-axis: wall seconds from start of this model's resolved series.
-        t0 = per_model_pred_ts[name][0]
-        xs = [(t - t0) / 60.0 for t in per_model_pred_ts[name]]
-        ax.plot(xs, rolled, label=name, color=colors.get(name, "#333"), linewidth=1.5)
-    ax.set_xlabel("minutes from first resolved prediction (event-time)")
-    ax.set_ylabel(f"rolling MAE (window={ROLLING_WINDOW})")
-    ax.set_title("Rolling MAE per model — online glucose forecast, 15-min horizon")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=10)
+        rolled   = _rolling(abs_errs, ROLLING_WINDOW)
+        t0       = per_model_pred_ts[name][0]
+        xs       = [(t - t0) / 60.0 for t in per_model_pred_ts[name]]
+        rolled_per_model[name] = (xs, rolled)
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(10, 8), sharex=True,
+        gridspec_kw={"height_ratios": [1, 1]},
+    )
+
+    # Top: baselines, linear y-axis, zoomed. Cap at 60 so the 10-ish vs
+    # 12-ish gap is unambiguous and transient linear_trend bumps still fit.
+    for name in BASELINES:
+        if name not in rolled_per_model:
+            continue
+        xs, rolled = rolled_per_model[name]
+        ax_top.plot(xs, rolled, label=f"{name} (final MAE {final_mae.get(name, float('nan')):.2f})",
+                    color=colors[name], linewidth=1.6)
+    ax_top.set_ylim(0, 60)
+    ax_top.set_ylabel(f"rolling MAE (window={ROLLING_WINDOW})")
+    ax_top.set_title("Rolling MAE — baselines (persistence vs linear_trend), 15-min horizon")
+    ax_top.grid(True, alpha=0.3)
+    ax_top.legend(fontsize=10, loc="upper right")
+
+    # Bottom: River models on log scale so the 7000 mg/dL spike doesn't
+    # dominate; include baselines as faint reference lines.
+    for name in BASELINES:
+        if name not in rolled_per_model:
+            continue
+        xs, rolled = rolled_per_model[name]
+        ax_bot.plot(xs, [max(v, 0.1) for v in rolled], color=colors[name],
+                    linewidth=0.9, alpha=0.5, linestyle="--", label=f"{name} (reference)")
+    for name in RIVERS:
+        if name not in rolled_per_model:
+            continue
+        xs, rolled = rolled_per_model[name]
+        ax_bot.plot(xs, [max(v, 0.1) for v in rolled],
+                    label=f"{name} (final MAE {final_mae.get(name, float('nan')):.2f})",
+                    color=colors[name], linewidth=1.5)
+    ax_bot.set_yscale("log")
+    ax_bot.set_xlabel("minutes from first resolved prediction (event-time)")
+    ax_bot.set_ylabel(f"rolling MAE (window={ROLLING_WINDOW}, log scale)")
+    ax_bot.set_title("Rolling MAE — River models (log scale)")
+    ax_bot.grid(True, which="both", alpha=0.3)
+    ax_bot.legend(fontsize=10, loc="upper right")
+
     fig.tight_layout()
     fig.savefig(out_dir / "mae_rolling.png", dpi=140)
     plt.close(fig)

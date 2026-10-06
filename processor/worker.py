@@ -418,11 +418,17 @@ def process_one_cycle(conn, detector: Detector, shard: int, num_shards: int,
 
 def _load_ml_contexts(conn, ml: MlPipeline) -> int:
     """Populate ML per-vp static context (source_tz, sampling_sec, diabetes_type,
-    speed_factor) from live.virtual_patient JOIN raw.readings_raw."""
+    speed_factor + the diurnal-feature anchors source_trace_start_utc,
+    time_offset_seconds and first_event_time) from live.virtual_patient JOIN
+    raw.readings_raw. first_event_time is the min(event_time) for the vp in
+    live.vitals_readings; if the vp has no readings yet it will be lazy-set
+    on the first process_reading call in ml._build_features."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT vp.virtual_patient_id, r.source_tz, r.sampling_sec,
-                   r.diabetes_type, vp.speed_factor
+                   r.diabetes_type, vp.speed_factor,
+                   vp.source_trace_start_utc, vp.time_offset_seconds,
+                   fev.first_event_time
               FROM live.virtual_patient vp
               JOIN LATERAL (
                   SELECT source_tz, sampling_sec, diabetes_type
@@ -430,14 +436,25 @@ def _load_ml_contexts(conn, ml: MlPipeline) -> int:
                    WHERE patient_id = vp.source_patient_id
                    LIMIT 1
               ) r ON true
+              LEFT JOIN LATERAL (
+                  SELECT min(event_time) AS first_event_time
+                    FROM live.vitals_readings
+                   WHERE virtual_patient_id = vp.virtual_patient_id
+              ) fev ON true
         """)
         n = 0
-        for vp_id, tz, sec, dtype, speed in cur.fetchall():
-            ml.set_context(vp_id,
-                           source_tz=tz or "UTC",
-                           sampling_sec=int(sec) if sec else 300,
-                           diabetes_type=dtype or "T1",
-                           speed_factor=float(speed) if speed else 1.0)
+        for row in cur.fetchall():
+            vp_id, tz, sec, dtype, speed, src_start, offset_s, first_et = row
+            ml.set_context(
+                vp_id,
+                source_tz=tz or "UTC",
+                sampling_sec=int(sec) if sec else 300,
+                diabetes_type=dtype or "T1",
+                speed_factor=float(speed) if speed else 1.0,
+                source_trace_start_utc=src_start,
+                time_offset_seconds=int(offset_s) if offset_s else 0,
+                first_event_time=first_et,
+            )
             n += 1
     return n
 

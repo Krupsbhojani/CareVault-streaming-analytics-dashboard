@@ -266,12 +266,36 @@ class VpMlContext:
     # In production (speed=1) event_time == source time, so this becomes a
     # no-op. In 10x replay the target event_time is only 90s ahead, not 15min.
     speed_factor: float = 1.0
+    # Diurnal-feature anchors — needed to convert event_time back to the vp's
+    # SOURCE time for the hour-of-day feature. Without these, hour_sin/hour_cos
+    # under N× replay would reflect the wall-clock-advanced event hour instead
+    # of the actual source-patient diurnal position (e.g. a replay running at
+    # 10× would cycle through 24 "source hours" in 2.4 wall hours).
+    #   source_time(event_t) = source_trace_start_utc + time_offset_seconds
+    #                        + (event_t - first_event_time) * speed_factor
+    # When any of these is None we fall back to event_t (correct at speed=1,
+    # approximate otherwise).
+    source_trace_start_utc: datetime | None = None
+    time_offset_seconds: int = 0
+    first_event_time: datetime | None = None
 
     def horizon_event_td(self) -> timedelta:
         return timedelta(seconds=HORIZON_SEC / max(self.speed_factor, 1e-9))
 
     def tolerance_event_td(self) -> timedelta:
         return timedelta(seconds=TOLERANCE_SEC_SOURCE / max(self.speed_factor, 1e-9))
+
+    def source_time_from_event(self, event_t: datetime) -> datetime:
+        """Convert an event_time to the source patient's absolute source time.
+        Returns event_t unchanged if anchors are not set (fallback for brand-new
+        vps or tests that don't bother threading the anchors through)."""
+        if self.source_trace_start_utc is None or self.first_event_time is None:
+            return event_t
+        elapsed_event_s = (event_t - self.first_event_time).total_seconds()
+        elapsed_source_s = elapsed_event_s * self.speed_factor
+        return self.source_trace_start_utc + timedelta(
+            seconds=self.time_offset_seconds + elapsed_source_s
+        )
 
 
 @dataclass
@@ -335,12 +359,18 @@ class MlPipeline:
         return s
 
     def set_context(self, vp_id: str, source_tz: str, sampling_sec: int,
-                    diabetes_type: str, speed_factor: float = 1.0) -> None:
+                    diabetes_type: str, speed_factor: float = 1.0,
+                    source_trace_start_utc: datetime | None = None,
+                    time_offset_seconds: int = 0,
+                    first_event_time: datetime | None = None) -> None:
         s = self.state(vp_id)
         s.ctx.source_tz = source_tz
         s.ctx.sampling_sec = int(sampling_sec)
         s.ctx.diabetes_type = diabetes_type
         s.ctx.speed_factor = float(speed_factor)
+        s.ctx.source_trace_start_utc = source_trace_start_utc
+        s.ctx.time_offset_seconds = int(time_offset_seconds)
+        s.ctx.first_event_time = first_event_time
 
     # -- feature extraction --
 
@@ -394,17 +424,23 @@ class MlPipeline:
 
         f["heart_rate_bpm"] = float(r.heart_rate_bpm) if r.heart_rate_bpm is not None else 70.0
 
-        # Local hour sin/cos in the patient's source timezone. For replay the
-        # event_time hour is distorted by the speed factor (10x replay means
-        # 24 wall hours = 240 source hours), so we convert to source time first.
-        source_delta = (r.event_time - s.ctx.__dict__.get("_wall_start", r.event_time)).total_seconds() * source_dt
+        # Local hour sin/cos in the patient's source timezone. Convert
+        # event_time -> source_time FIRST so under N× replay this tracks the
+        # actual source-patient diurnal position, not the wall-clock-advanced
+        # event hour (replay at 10× cycles through 24 source hours in 2.4 wall
+        # hours; without this conversion the feature is scrambled). Lazy-set
+        # first_event_time on first use so vps that were brand-new at startup
+        # still get a self-consistent conversion from here on.
+        if s.ctx.first_event_time is None:
+            s.ctx.first_event_time = r.event_time
+        source_time = s.ctx.source_time_from_event(r.event_time)
         try:
             import zoneinfo
             tz = zoneinfo.ZoneInfo(s.ctx.source_tz)
-            local = r.event_time.astimezone(tz)
+            local = source_time.astimezone(tz)
             hour = local.hour + local.minute / 60.0
         except Exception:
-            hour = r.event_time.hour + r.event_time.minute / 60.0
+            hour = source_time.hour + source_time.minute / 60.0
         f["hour_sin"] = math.sin(2 * math.pi * hour / 24.0)
         f["hour_cos"] = math.cos(2 * math.pi * hour / 24.0)
 
@@ -421,15 +457,23 @@ class MlPipeline:
                report_in_source_time: bool = False, speed: float = 1.0
                ) -> float | None:
         """Least-squares slope (mg/dL per minute) over `window_min` event-time
-        minutes of the most recent buffer. If report_in_source_time, divide
-        the x-axis by `speed` so the output is mg/dL per SOURCE minute (so the
-        threshold-free slope value stays meaningful under 10x replay)."""
+        minutes of the most recent buffer. If report_in_source_time, MULTIPLY
+        the x-axis by `speed` so the output is mg/dL per SOURCE minute.
+
+        Direction: under N× replay the replayer runs source `speed`× faster
+        through event-time, so 1 event-minute of elapsed replay represents
+        `speed` source-minutes of source data (0.5 event-min = 5 source-min
+        at 10×). To convert the event-min x-axis into a source-min x-axis,
+        we multiply xs by `speed`. Previously this did `1/speed`, which made
+        slope come out speed² too large and the ±60 clip in LinearTrendModel
+        saturated on every non-zero slope under replay.
+        """
         cutoff = now_ts - timedelta(minutes=window_min)
         pts = [(ts, v) for ts, v in recent if ts >= cutoff]
         if len(pts) < 2:
             return None
         t0 = pts[0][0]
-        time_scale = (1.0 / speed) if report_in_source_time else 1.0
+        time_scale = speed if report_in_source_time else 1.0
         xs = [(ts - t0).total_seconds() / 60.0 * time_scale for ts, _ in pts]
         ys = [v for _, v in pts]
         n = len(xs)

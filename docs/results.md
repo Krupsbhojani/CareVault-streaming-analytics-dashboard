@@ -261,16 +261,20 @@ Source: inline eval across session, final numbers in `eval/model_eval.py`.
 | 3 | river_ht (warm-up gate = 500 learned examples + learn-during-warmup fix) | 16,897 (post-iter-2 variance) | **135.77** | 124× better |
 
 ### 5.2 Final 30-min prequential eval, 2,000 vps × 10× concurrent
-Source: `eval/model_eval.py` output on 30-min run data; `eval/figures/mae_rolling.png`, `eval/figures/clarke_grid.png`.
+Source: `eval/model_eval.py` output on 30-min run data (2026-10-05, both event-time ↔ source-time fixes applied — see §5.7 for which numbers this supersedes); `eval/figures/mae_rolling.png`, `eval/figures/clarke_grid.png`.
 
 | model | n resolved | **MAE** | RMSE | % vs persistence | Zone A | Zone B | Zone C | Zone D | Zone E |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **persistence** | 91,702 | **10.81** | **25.09** | baseline | **86,558 (94.4 %)** | 4,548 (5.0 %) | 269 | 321 | 6 |
-| linear_trend | 91,702 | 52.90 | 59.08 | −389 % | 15,040 | 75,371 | 389 | 407 | 495 |
-| river_linreg | 91,702 | 84.87 | 1,172.02 | −685 % | 76,291 | 9,164 | 3,426 | 757 | 2,064 |
-| river_ht | 85,331 | 238.60 | 29,980 | −2,106 % | 70,094 | 13,768 | 37 | 1,429 | 3 |
+| **persistence** | 91,674 | **10.81** | **25.09** | baseline | **86,532 (94.4 %)** | 4,546 (5.0 %) | 269 | 321 | 6 |
+| linear_trend | 91,674 | **12.20** | **26.57** | **−12.9 %** | **84,096** | 7,052 | 281 | 236 | 9 |
+| river_linreg | 91,674 | 105.87 | 1,254.87 | −879 % | 76,711 | 8,991 | 3,197 | 748 | 2,027 |
+| river_ht | 85,303 | 98.20 | 7,179.44 | −808 % | 70,817 | 12,722 | 28 | 1,736 | 0 |
 
-Resolved predictions/sec: **200.4** across all models.
+Resolved predictions/sec: **200.3** across all models.
+
+→ Persistence still wins. Linear_trend is now a credible second-best (12.9 % worse, not 389 %), river_ht halved its MAE, river_linreg got slightly worse (its divergence failure mode is unchanged, only the features it diverges on changed).
+
+The `mae_rolling.png` figure is now split into two panels so the 10.81 vs 12.20 comparison isn't flattened by river_linreg's early 7,000 mg/dL spike: top panel baselines on linear y ∈ [0, 60], bottom panel River models on log y with the baselines dashed for reference.
 
 ### 5.3 Delayed-label / eviction breakdown
 Source: SQL CTE classifier on live.predictions, 5-min run.
@@ -309,8 +313,10 @@ Source: `eval/exogenous_test.py` on `raw.readings_raw` AZT1D cohort. 299,236 (fe
 ### 5.7 Historical / superseded ML numbers
 - **[superseded]** First-pass persistence MAE 39.86 at 30-min run — the 15 event-time min horizon was 150 source min = 2.5 h at 10× replay. Fixed by `HORIZON_SEC / speed_factor`; new MAE 10.81.
 - **[superseded]** First-pass river_linreg MAE 3.5 × 10¹⁰ (unscaled target, default SGD). Fixed to 1,064 after target standardization + SGD(1e-3).
-- **[superseded]** First-pass river_ht MAE 2,579 at 30-min / 16,897 post-fix-1 → 238.60 after warm-up gate at 500 examples.
-- **[superseded]** First-pass linear_trend MAE 998 (15-min slope projected 15 min) → 52.90 after window=30 min + clip Δ ≤ ±60 mg/dL.
+- **[superseded]** First-pass river_ht MAE 2,579 at 30-min / 16,897 post-fix-1 → 238.60 after warm-up gate at 500 examples. **[superseded again, 2026-10-05]** The 238.60 figure was itself invalid because `_build_features.hour_sin/hour_cos` were computed from event-time, not source-time — under 10× replay the vp cycled through 24 "source hours" in 2.4 wall-hours, scrambling the diurnal signal the HT splits on. After fixing the hour feature (ml.py:400 — convert event_t → source_t via `VpMlContext.source_time_from_event` before taking hour) the correct 30-min figure is **MAE 98.20, RMSE 7,179**. Test gate: `tests/test_ml.py::test_hour_feature_tracks_source_time_at_any_speed`.
+- **[superseded]** First-pass linear_trend MAE 998 (15-min slope projected 15 min) → 52.90 after window=30 min + clip Δ ≤ ±60 mg/dL. **[superseded again, 2026-10-05]** The 52.90 figure was invalid because `_slope()`'s event-time → source-time axis conversion was inverted (`time_scale = 1/speed` instead of `speed`), making the computed slope `speed²` times too large under replay. With speed=10 the ±60 clip saturated on every non-zero slope and linear_trend effectively became "persistence ± 60". After fixing (`time_scale = speed` at ml.py:440) the correct 30-min figure is **MAE 12.20, RMSE 26.57** — 12.9 % worse than persistence, not 389 %. Diagnostic chart that caught it: `scratch/forecast_check.py`. Test gate: `tests/test_ml.py::test_slope_is_in_source_minute_units_at_any_speed`.
+- **[superseded, 2026-10-05]** The 5.2 Clarke counts for linear_trend (A=15,040, B=75,371, E=495) were from the same broken run; corrected counts are A=84,096, B=7,052, E=9. For river_ht the Clarke numbers (A=70,094, B=13,768, D=1,429) are superseded by A=70,817, B=12,722, D=1,736, E=0.
+- **[not superseded]** The exogenous experiment (§5.6) numbers are unchanged by either fix. `eval/exogenous_test.py` uses its own local `_slope` and `build_features` that work in pure source-time (reads `raw.readings_raw.ts_utc` directly, no replay compression), so neither bug touched them. The "no model beats persistence with or without insulin/carbs/basal" finding was always on correct code.
 
 ---
 
@@ -387,7 +393,7 @@ Source: `sql/schema_live.sql` lines 255-272.
 | Dashboard panel p95 reported | harness exists, no measured values captured this session | `dashboard/bench.py` was never run against the running stack with its output persisted | §6.1 |
 | `dashboard_ro` created on Azure | role defined locally, not confirmed on Azure | one-time manual step | §7.4 |
 | Clarke Zone A ≥ 95 % for best model | persistence at 94.4 % | 0.6 pp short on the 30-min run; literature baseline for 15-min persistence is 93–96 % so this is in-band | §5.2 |
-| Any ML model beats persistence by any margin | none did | shown offline experiment with insulin+carbs also did not beat persistence | §5.6 |
+| Any ML model beats persistence by any margin | none did (both live stream and offline) | linear_trend narrowed the gap from −389 % to −12.9 % after the slope/hour fixes but is still worse than persistence; river_ht halved its MAE (238 → 98) but still 808 % worse; river_linreg still diverges | §5.2, §5.6 |
 
 ---
 

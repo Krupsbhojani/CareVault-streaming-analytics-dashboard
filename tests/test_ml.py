@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from processor.ml import (  # noqa: E402
     HORIZON_MIN, HORIZON_SEC, MlPipeline, TOLERANCE_SEC_SOURCE,
-    UNTRUSTWORTHY_RULE_IDS, clarke_error_grid_zone,
+    UNTRUSTWORTHY_RULE_IDS, SLOPE_WINDOW_MIN, clarke_error_grid_zone,
 )
 
 
@@ -170,6 +170,126 @@ def test_horizon_is_source_time_regardless_of_speed(speed):
         source_gap_sec = n_steps_to_label * sampling_sec
         assert source_gap_sec == HORIZON_SEC, (
             f"test bookkeeping broken: {source_gap_sec}s != {HORIZON_SEC}s"
+        )
+
+
+# ============================================================================
+# Slope is in SOURCE-min units at every replay speed
+# ============================================================================
+# Fourth event-time / source-time mixup caught: _slope was reporting values
+# `speed²` too large under N× replay because the x-axis conversion was in the
+# wrong direction. At speed=10 a true physiologic 2 mg/dL/source-min slope was
+# arriving at LinearTrendModel as 200 mg/dL/source-min; the ±60 clip then
+# saturated on every non-zero slope. The feature's own docstring/column name
+# ("mg/dL per SOURCE minute") is the contract this test enforces at speeds
+# 1, 10 and 100.
+
+@pytest.mark.parametrize("speed", [1.0, 10.0, 100.0])
+def test_slope_is_in_source_minute_units_at_any_speed(speed):
+    """Construct a trace with glucose rising a known 2 mg/dL per SOURCE
+    minute at the given replay speed. The slope feature must come back as
+    2.0 mg/dL per source-min — invariant to replay speed, since the feature
+    is defined in source time.
+    """
+    from processor.ml import MlPipeline
+    vp = f"vp:slope_{int(speed)}"
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    sampling_sec = 300                            # 5-min source cadence
+    event_dt_sec = sampling_sec / speed           # 300/speed seconds of event-time per source sample
+    TRUE_SLOPE   = 2.0                            # mg/dL per source minute — ground truth
+    cgm_at_step  = lambda i: 100.0 + TRUE_SLOPE * (i * sampling_sec / 60.0)
+
+    # Prime enough source-samples that the slope window (SLOPE_WINDOW_MIN
+    # source-min) is comfortably full. At source cadence of 5 min, 10 samples
+    # covers 45 source-min of history — more than SLOPE_WINDOW_MIN=30.
+    n_prime = 10
+
+    pipe = MlPipeline()
+    pipe.set_context(vp, source_tz="UTC", sampling_sec=sampling_sec,
+                     diabetes_type="T1", speed_factor=speed)
+    s = pipe.state(vp)
+
+    # Seed the per-vp buffer directly so we test _slope's math in isolation
+    # from the rest of process_reading's bookkeeping.
+    for i in range(n_prime):
+        s.recent.append((base + timedelta(seconds=i * event_dt_sec), cgm_at_step(i)))
+
+    # Now ask _build_features to compute slope_15min for the (n_prime+1)-th
+    # reading. This is the exact path linear_trend consumes.
+    r = _mk_reading(
+        vp,
+        base + timedelta(seconds=n_prime * event_dt_sec),
+        cgm_at_step(n_prime),
+        sampling_sec,
+    )
+    feat = pipe._build_features(r, s)
+    observed = feat["slope_15min"]
+    assert observed == pytest.approx(TRUE_SLOPE, rel=1e-9, abs=1e-9), (
+        f"speed={speed}: slope_15min = {observed!r} mg/dL per source-min, "
+        f"expected {TRUE_SLOPE}. ratio observed/expected = "
+        f"{observed/TRUE_SLOPE:.3g}x (= speed^2 if the x-axis conversion is inverted)."
+    )
+
+
+# ============================================================================
+# hour_sin/hour_cos reflect SOURCE-patient local hour at any replay speed
+# ============================================================================
+# Fifth event-time / source-time mixup — the diurnal feature was taking
+# `r.event_time.astimezone(tz).hour` directly, so under N× replay a vp
+# cycled through 24 "source hours" in 24/N wall-hours. River models learn
+# a scrambled time-of-day signal unless we convert back to source time.
+
+@pytest.mark.parametrize("speed", [1.0, 10.0, 100.0])
+def test_hour_feature_tracks_source_time_at_any_speed(speed):
+    """At any replay speed, hour_sin and hour_cos must correspond to the
+    source patient's local hour at the moment the reading was generated
+    (source time), NOT the wall-clock-advanced event hour."""
+    from processor.ml import MlPipeline
+    vp = f"vp:hour_{int(speed)}"
+    # Source trace starts at 03:00:00 UTC in the source patient's history.
+    source_start = datetime(2020, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+    # Replay was fired up at 06:00:00 UTC today (event-time clock).
+    event_start  = datetime(2026, 10, 5, 6, 0, 0, tzinfo=timezone.utc)
+    sampling_sec = 300
+    event_dt_sec = sampling_sec / speed       # event-sec between consecutive source samples
+    pipe = MlPipeline()
+    pipe.set_context(vp, source_tz="UTC", sampling_sec=sampling_sec,
+                     diabetes_type="T1", speed_factor=speed,
+                     source_trace_start_utc=source_start,
+                     time_offset_seconds=0,
+                     first_event_time=event_start)
+    s = pipe.state(vp)
+    # Prime a few readings so the feature builder's lag/slope paths are happy.
+    for i in range(3):
+        s.recent.append((event_start + timedelta(seconds=i * event_dt_sec), 100.0 + i))
+    # Score the fourth reading, 3 source-samples in = 3 × sampling_sec source-sec elapsed.
+    # So at speed=10, event_elapsed = 3 × 30 = 90 s event; source_elapsed = 900 s = 15 min source.
+    # Expected source_time = source_start + source_elapsed = source_start + i * sampling_sec.
+    i_fourth = 3
+    r = _mk_reading(
+        vp,
+        event_start + timedelta(seconds=i_fourth * event_dt_sec),
+        103.0, sampling_sec,
+    )
+    feat = pipe._build_features(r, s)
+    expected_source_t = source_start + timedelta(seconds=i_fourth * sampling_sec)
+    expected_hour     = expected_source_t.hour + expected_source_t.minute / 60.0
+    expected_sin      = math.sin(2 * math.pi * expected_hour / 24.0)
+    expected_cos      = math.cos(2 * math.pi * expected_hour / 24.0)
+    assert feat["hour_sin"] == pytest.approx(expected_sin, abs=1e-9), (
+        f"speed={speed}: hour_sin = {feat['hour_sin']!r}, expected {expected_sin!r} "
+        f"(source hour {expected_hour:.3f})"
+    )
+    assert feat["hour_cos"] == pytest.approx(expected_cos, abs=1e-9)
+    # And prove the OLD (buggy) code would have produced a different value by
+    # using the event-time hour directly — at speed=10 those are many hours
+    # apart.
+    if speed > 1.0:
+        buggy_hour = r.event_time.hour + r.event_time.minute / 60.0
+        buggy_sin  = math.sin(2 * math.pi * buggy_hour / 24.0)
+        assert abs(feat["hour_sin"] - buggy_sin) > 1e-3, (
+            f"speed={speed}: hour_sin matches event-time hour ({buggy_hour:.3f}) "
+            f"— the source-time conversion is not being applied"
         )
 
 

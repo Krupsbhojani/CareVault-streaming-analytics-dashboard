@@ -207,16 +207,61 @@ def _fetch_top(vp: str) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
-def _fetch_cgm_series(vp: str, minutes: int = 180) -> pd.DataFrame:
+def _fetch_cgm_series(vp: str, minutes: int = 60) -> pd.DataFrame:
+    """Raw CGM readings for the last `minutes` of THIS vp's event-time,
+    anchored to its own max(event_time). Anchoring to the vp's clock rather
+    than wall-clock `now()` matches scratch/forecast_check.py and keeps the
+    chart useful even when the replay has paused (otherwise `now() - 60 min`
+    returns nothing on a stale DB).
+
+    Also returns per-reading rather than minute roll-ups because the forecast
+    overlay below compares model predictions to the SAME readings the
+    predictions were resolved against — minute averages would mis-align."""
     df = timed_query("op_cgm_series", """
-        SELECT minute_start_utc AS ts,
-               cgm_mgdl_mean    AS cgm
-          FROM live.vitals_1min
-         WHERE virtual_patient_id = %s
-           AND minute_start_utc > now() - make_interval(mins => %s)
-         ORDER BY minute_start_utc
-    """, (vp, minutes))
+        WITH anchor AS (
+            SELECT max(event_time) AS vp_max_et
+              FROM live.vitals_readings
+             WHERE virtual_patient_id = %s
+        )
+        SELECT v.event_time AS ts, v.cgm_mgdl AS cgm
+          FROM live.vitals_readings v, anchor a
+         WHERE v.virtual_patient_id = %s
+           AND v.event_time > a.vp_max_et - make_interval(mins => %s)
+           AND v.event_time <= a.vp_max_et
+           AND v.cgm_mgdl IS NOT NULL
+         ORDER BY v.event_time
+    """, (vp, vp, minutes))
     return df
+
+
+def _fetch_recent_predictions(vp: str, minutes: int = 60) -> pd.DataFrame:
+    """Historical predictions over the last `minutes` of this vp's event-time
+    for the two baseline models. Joined to live.vitals_readings on
+    predicted_ts_utc = event_time (same semantics as
+    scratch/forecast_check.py), so every prediction row we return had an
+    actual reading at exactly its target timestamp — i.e. the forecast was
+    resolvable."""
+    return timed_query("op_recent_predictions", """
+        WITH anchor AS (
+            SELECT max(event_time) AS vp_max_et
+              FROM live.vitals_readings
+             WHERE virtual_patient_id = %s
+        )
+        SELECT p.model_name          AS model,
+               p.predicted_ts_utc    AS ts,
+               p.predicted_cgm_mgdl  AS cgm
+          FROM live.predictions p
+          JOIN live.vitals_readings v
+            ON v.virtual_patient_id = p.virtual_patient_id
+           AND v.event_time         = p.predicted_ts_utc
+         CROSS JOIN anchor a
+         WHERE p.virtual_patient_id = %s
+           AND p.model_name IN ('persistence', 'linear_trend')
+           AND p.predicted_ts_utc > a.vp_max_et - make_interval(mins => %s)
+           AND p.predicted_ts_utc <= a.vp_max_et
+           AND p.predicted_cgm_mgdl IS NOT NULL
+         ORDER BY p.model_name, p.predicted_ts_utc
+    """, (vp, vp, minutes))
 
 
 # The dashboard reads the persistence model (naive "next reading = current
@@ -491,50 +536,58 @@ top_card_fragment()
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
-    now = datetime.now(timezone.utc)
-    # Keep the domain at 3 hours so the chart doesn't change scale as data
-    # arrives. The right edge extends to include the forecast point if it
-    # lands past 'now' (keep-up case) or to leave a 20 min margin otherwise.
-    x_lo = now - timedelta(hours=3)
-    x_hi = now
+_WINDOW_MIN            = 60    # last 60 min of event-time
+# Colour the model overlays the same way as scratch/forecast_check.py so the
+# two artefacts read identically.
+_COLOR_PERSISTENCE     = "#2874a6"
+_COLOR_LINEAR_TREND    = "#b7950b"
+
+
+def _build_cgm_chart(cgm: pd.DataFrame, preds: pd.DataFrame,
+                     forecast: pd.DataFrame) -> alt.Chart:
+    # Anchor the domain to THIS vp's latest reading, not wall-clock. Matches
+    # what forecast_check.py does. Under live replay the two coincide; under
+    # stale data (replay paused) wall-clock would leave the chart empty.
+    if not cgm.empty:
+        vp_max_et = pd.to_datetime(cgm["ts"]).max()
+        if vp_max_et.tzinfo is None:
+            vp_max_et = vp_max_et.tz_localize("UTC")
+        vp_max_et = vp_max_et.to_pydatetime()
+    else:
+        vp_max_et = datetime.now(timezone.utc)
+    x_lo = vp_max_et - timedelta(minutes=_WINDOW_MIN)
+    x_hi = vp_max_et
     if not forecast.empty:
         forecast_ts_max = pd.to_datetime(forecast["ts"]).max()
         if forecast_ts_max.tzinfo is None:
             forecast_ts_max = forecast_ts_max.tz_localize("UTC")
         forecast_ts_max = forecast_ts_max.to_pydatetime()
-        x_hi = max(x_hi, forecast_ts_max) + timedelta(minutes=5)
+        x_hi = max(x_hi, forecast_ts_max) + timedelta(minutes=2)
     x_scale = alt.Scale(domain=[x_lo, x_hi])
     y_scale = alt.Scale(domain=[40, 300])
 
-    # Bands: pink for too-low, green for safe.
-    bands = pd.DataFrame([
-        {"lo": 70,  "hi": 180, "kind": "safe range"},
-        {"lo": 40,  "hi": 70,  "kind": "too low"},
-    ])
-    band_layer = alt.Chart(bands).mark_rect(opacity=0.35).encode(
-        y="lo:Q",
-        y2="hi:Q",
-        color=alt.Color("kind:N", scale=alt.Scale(
-            domain=["safe range", "too low"],
-            range=["#DBEDE3", "#F7DAE1"],
-        ), legend=None),
+    # Safe-range band (70-180). The only band — the pink too-low band was
+    # removed to leave the model overlays visible against a quieter backdrop.
+    band_df = pd.DataFrame([{"lo": 70, "hi": 180, "kind": "safe range"}])
+    band_layer = alt.Chart(band_df).mark_rect(opacity=0.35, color="#DBEDE3").encode(
+        y="lo:Q", y2="hi:Q",
     )
-
     layers = [band_layer]
 
-    # Axis reference values (180, 70, 40)
-    ax_df = pd.DataFrame([{"y": 180}, {"y": 70}, {"y": 40}])
-    rule_layer = alt.Chart(ax_df).mark_rule(
-        color="#9EAAB0", strokeWidth=0.5, strokeDash=[2, 2],
+    # Low line at 70 (dashed red-ish). The 180 and 40 reference lines were
+    # removed to keep the chart free of clutter around the forecast overlays;
+    # the safe band already encodes the upper edge.
+    low_line = alt.Chart(pd.DataFrame([{"y": 70}])).mark_rule(
+        color="#9EAAB0", strokeWidth=0.6, strokeDash=[2, 2],
     ).encode(y="y:Q")
-    layers.append(rule_layer)
+    layers.append(low_line)
 
-    # X-axis labels: two fixed text marks (Vega labelExpr conditionals on
-    # datetime equality are fiddly; text marks are stable).
+    # X-axis endpoint labels: two text marks. The right-edge label is
+    # "latest reading" rather than "now" because the window is anchored to
+    # the vp's own event-time (which may trail wall-clock under lag/pause).
     xlabel_df = pd.DataFrame([
-        {"ts": x_lo, "label": "3 hours ago", "anchor": "left"},
-        {"ts": now,  "label": "now",         "anchor": "right"},
+        {"ts": x_lo,      "label": "60 min ago"},
+        {"ts": vp_max_et, "label": "latest reading"},
     ])
     xlabels = alt.Chart(xlabel_df).mark_text(
         color="#5C6A70", fontSize=11, dy=155,
@@ -544,9 +597,32 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
     )
     layers.append(xlabels)
 
+    # ---- Model overlays: thin lines + point markers over the historical
+    # window. One series per model so they stack independently. Each row of
+    # `preds` has (model, ts, cgm). We split by model so each gets its own
+    # fixed colour (not an Altair legend colour-encoding) — the labelled
+    # legend is handled by the caption + the right-column prediction card.
+    if not preds.empty:
+        for model_name, color in (
+            ("persistence",   _COLOR_PERSISTENCE),
+            ("linear_trend",  _COLOR_LINEAR_TREND),
+        ):
+            m = preds[preds["model"] == model_name]
+            if m.empty:
+                continue
+            overlay_line = alt.Chart(m).mark_line(
+                color=color, strokeWidth=1.0, opacity=0.85,
+            ).encode(x="ts:T", y="cgm:Q")
+            overlay_pts = alt.Chart(m).mark_point(
+                shape="circle", size=18, filled=True, color=color, opacity=0.85,
+            ).encode(x="ts:T", y="cgm:Q")
+            layers.extend([overlay_line, overlay_pts])
+
+    # ---- Actual CGM line (dark, heaviest weight) — drawn after the overlays
+    # so it sits on top of them.
     if not cgm.empty:
         line_layer = alt.Chart(cgm).mark_line(
-            color=TEXT_PRIMARY, strokeWidth=2.25,
+            color=TEXT_PRIMARY, strokeWidth=2.4,
         ).encode(
             x=alt.X("ts:T", title=None, scale=x_scale,
                     axis=alt.Axis(labels=False, ticks=False,
@@ -558,7 +634,7 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
         )
         layers.append(line_layer)
 
-        # First 70-cross (falling) marker
+        # First 70-cross (falling) marker — retained from the previous chart.
         below = cgm[cgm["cgm"] < 70].copy()
         above = cgm[cgm["cgm"] >= 70].copy()
         cross = None
@@ -580,17 +656,17 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
             ).encode(x="ts:T", y="cgm:Q")
             layers.extend([cross_marker, cross_label])
 
-        # Latest reading (filled dot)
+        # Latest reading (filled dot) — the anchor the forward forecast line
+        # extends from.
         latest = cgm.iloc[[-1]].copy()
         latest_marker = alt.Chart(latest).mark_point(
             shape="circle", size=120, filled=True, color=TEXT_PRIMARY,
         ).encode(x="ts:T", y="cgm:Q")
         layers.append(latest_marker)
 
-    # Forecast layer: dashed line + shaded band stretching from the current
-    # reading to the predicted point. The forecast DataFrame carries two rows
-    # (now, predicted_ts_utc) built in chart_fragment, with the band as
-    # (cgm ± typical_error).
+    # ---- Forward prediction (dashed extension past the last reading).
+    # Same semantics as before: two rows (anchor_reading, predicted_point)
+    # plus an optional typical-error band.
     if not forecast.empty:
         fdash = alt.Chart(forecast).mark_line(
             color=EMERGENCY, strokeDash=[4, 3], strokeWidth=2,
@@ -602,8 +678,6 @@ def _build_cgm_chart(cgm: pd.DataFrame, forecast: pd.DataFrame) -> alt.Chart:
             )
             layers.append(band)
         layers.append(fdash)
-        # A small ring on the predicted point so the reader sees where the
-        # forecast lands exactly.
         tip = forecast.iloc[[-1]].copy()
         tip_marker = alt.Chart(tip).mark_point(
             shape="circle", size=90, filled=False, color=EMERGENCY, strokeWidth=2,
@@ -657,15 +731,16 @@ def _build_forecast_frame(cgm: pd.DataFrame, fx: pd.DataFrame,
 
 @st.fragment(run_every="5s", parallel=True)
 def chart_fragment() -> None:
-    cgm = _fetch_cgm_series(selected_vp, minutes=180)
+    cgm   = _fetch_cgm_series(selected_vp, minutes=_WINDOW_MIN)
     if cgm.empty:
         st.markdown(
-            '<div class="card"><h3>Waiting for the first hour of readings</h3>'
+            '<div class="card"><h3>Waiting for the first readings</h3>'
             '<p>The chart draws itself as readings arrive.</p></div>',
             unsafe_allow_html=True,
         )
         return
-    fx = _fetch_latest_forecast(selected_vp)
+    preds = _fetch_recent_predictions(selected_vp, minutes=_WINDOW_MIN)
+    fx    = _fetch_latest_forecast(selected_vp)
     err_df = _fetch_recent_error(selected_vp)
     typical_err = None
     if not err_df.empty:
@@ -675,9 +750,33 @@ def chart_fragment() -> None:
         elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
             typical_err = float(r["p50_global"])
     forecast_df = _build_forecast_frame(cgm, fx, typical_err)
-    st.markdown('<div class="card" style="padding:12px 12px 4px 12px;">',
+
+    # Chart card + axis label + plain-language caption. The axis label makes
+    # the time-base explicit (event_time is the replay's own clock; under N×
+    # replay the ticks are wall-clock-aligned at ingest but do NOT correspond
+    # to the source patient's local day). The caption spells out what the
+    # thin overlay lines actually mean.
+    st.markdown('<div class="card" style="padding:12px 12px 8px 12px;">',
                 unsafe_allow_html=True)
-    st.altair_chart(_build_cgm_chart(cgm, forecast_df), width='stretch')
+    st.altair_chart(_build_cgm_chart(cgm, preds, forecast_df), width='stretch')
+    st.markdown(
+        '<div style="font-size:11px; color:#8B9499; margin:2px 0 6px 0;">'
+        'event time (UTC) — the replay\'s clock, not wall-clock'
+        '</div>'
+        '<div style="font-size:12px; color:#5C6A70; line-height:1.4;">'
+        f'<span style="display:inline-block; width:10px; height:10px; '
+        f'background:{_COLOR_PERSISTENCE}; border-radius:50%; margin-right:4px;"></span>'
+        'persistence &nbsp;&nbsp;'
+        f'<span style="display:inline-block; width:10px; height:10px; '
+        f'background:{_COLOR_LINEAR_TREND}; border-radius:50%; margin-right:4px;"></span>'
+        'linear_trend'
+        '<br/>'
+        'The thin lines show what each model expected for that moment, '
+        '15 minutes earlier, so the gap between a thin line and the dark line '
+        'is that model\'s error.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown('</div>', unsafe_allow_html=True)
 
 
