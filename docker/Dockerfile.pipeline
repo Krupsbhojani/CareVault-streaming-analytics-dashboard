@@ -1,0 +1,60 @@
+# CareVault — pipeline image (replayer + worker, scheduled Container Apps job).
+#
+# This image is deliberately separate from the dashboard image. It contains
+# only what processor/ and replay/ (and the one constant they pull from
+# loader/) need at runtime:
+#   - processor/   — stream worker + ML pipeline
+#   - replay/      — build_vps + replayer
+#   - loader/      — CONNINFO_DEFAULT constant (replay imports from load_raw)
+#
+# NOT in this image, by design:
+#   - dashboard/   — different image, lives on App Service, not touched
+#   - data/        — raw CSVs; the loader runs once against the DB and the
+#                    pipeline then reads from raw.readings_raw. No reason to
+#                    ship 2 GB of CSV into every scheduled execution.
+#   - sql/         — schema already deployed to Azure
+#   - tests/       — not needed to run; also keeps attack surface small
+#   - eval/, scratch/, verification/ — analysis-only
+#
+# Scheduled Container Apps jobs scale to zero between runs, so image size
+# matters less than image-pull latency; still, slim base + no-cache pip
+# keeps it under ~400 MB which pulls in a few seconds.
+FROM python:3.13-slim-bookworm
+
+# Minimal OS deps: psycopg[binary] bundles libpq, and bash is needed by the
+# entrypoint. Everything else river/scipy/pandas ships as wheels.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first so the (slow) wheel installs cache between code-only
+# rebuilds. requirements file is in docker/ so this layer invalidates only
+# when deps actually change.
+COPY docker/pipeline-requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/pipeline-requirements.txt
+
+# Code. Each directory is a copy of the laptop checkout — no edits, no
+# rewrites of imports, no stub modules. The containerization constraint
+# the user set is that we don't modify replay/ or processor/ beyond what
+# the container needs; so loader/ comes along too, satisfying the existing
+# `from loader.load_raw import CONNINFO_DEFAULT` imports verbatim.
+COPY processor/ /app/processor/
+COPY replay/    /app/replay/
+COPY loader/    /app/loader/
+
+# Entrypoint orchestrates the two processes (see pipeline-entrypoint.sh).
+COPY docker/pipeline-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Flush stdout/stderr immediately so Container Apps log stream is live.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# tini as PID 1 so SIGTERM from Container Apps reaches the entrypoint
+# cleanly and the entrypoint's own signal handling of the worker still
+# works. Without this, the Python child inherits PID 1 and signals get
+# dropped — a common cause of jobs billing to their timeout instead of
+# exiting on time.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

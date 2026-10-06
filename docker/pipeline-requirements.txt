@@ -1,0 +1,14 @@
+# Pipeline-only dependencies. Everything processor/, replay/ and loader/
+# transitively import at module scope (loader/load_raw.py has
+# `import pandas as pd` at the top, and replay/* pulls it in for the
+# CONNINFO_DEFAULT constant — hence pandas is here even though the pipeline
+# never calls into the loader at runtime).
+#
+# Pinned to the exact versions the local dev + 30-min eval ran against on
+# 2026-10-05 so Azure can't drift under us between runs. Bump deliberately,
+# not on every rebuild.
+psycopg[binary]==3.3.6
+river==0.26.1
+numpy==2.3.5
+pandas==2.3.3
+scipy==1.16.3

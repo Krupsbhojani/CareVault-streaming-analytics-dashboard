@@ -1,0 +1,63 @@
+# Build context for docker/Dockerfile.pipeline.
+#
+# Pipeline image needs: processor/, replay/, loader/, and three files under
+# docker/ (Dockerfile.pipeline, pipeline-entrypoint.sh, pipeline-requirements.txt).
+# Everything else — the AZT1D + Shanghai datasets alone are ~900 MB — is
+# excluded here so `docker build` doesn't ship it to the daemon or waste a
+# GitHub Actions runner's upload budget.
+#
+# Blacklist style on purpose: dockerignore's `!dir/` re-inclusion rules
+# interact badly with trailing slashes and prefix matching when you also
+# want to re-include specific files inside a mostly-excluded directory.
+# Explicit exclusions are easier to read and audit than a whitelist with
+# five re-include lines.
+
+# —— large data not needed at runtime (raw.readings_raw is already loaded on Azure) ——
+data/
+
+# —— analysis / scratch directories ——
+scratch/
+eval/
+verification/
+bench/
+
+# —— offline / dev-only ——
+tests/
+docs/
+scripts/
+sql/
+
+# —— different service, different image, deploys separately via App Service ——
+dashboard/
+
+# —— docker files that aren't part of the pipeline image ——
+docker/Dockerfile.postgres
+docker/pipeline-deploy.md
+
+# —— repo / IDE metadata ——
+.git/
+.github/
+.claude/
+.pytest_cache/
+.venv-deploy/
+.gitignore
+.env
+.env.*
+
+# —— project artefacts at root that the pipeline doesn't need ——
+CLAUDE.md
+Project1_CareVault_Plan_v2.pdf
+docker-compose.yml
+startup.sh
+requirements.txt
+
+# —— generated / stale files anywhere ——
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.log
+**/*.swp
+**/*.tmp
+**/.DS_Store
+**/Thumbs.db

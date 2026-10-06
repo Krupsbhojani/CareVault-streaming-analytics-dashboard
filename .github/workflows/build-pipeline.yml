@@ -1,0 +1,111 @@
+name: Build and push pipeline image to GHCR
+
+# Builds docker/Dockerfile.pipeline and publishes it to GitHub Container
+# Registry so the Azure Container Apps scheduled job can pull it.
+#
+# Separate from the dashboard workflow (main_carevault-dash-kb.yml) in every
+# way — different name, different triggers, different permissions, different
+# artefact. Nothing here touches the App Service deployment.
+#
+# Tags produced on every main push:
+#   ghcr.io/<owner>/carevault-pipeline:latest
+#   ghcr.io/<owner>/carevault-pipeline:sha-<short-sha>     e.g. sha-a1b2c3d
+#   ghcr.io/<owner>/carevault-pipeline:<full-sha>          immutable pin
+#
+# Auth: the built-in GITHUB_TOKEN with packages:write. No PAT, no secrets to
+# rotate. The token's scope is this workflow run only.
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something that lands in the pipeline image actually
+    # changes. Dashboard-only pushes shouldn't trigger a pipeline rebuild
+    # (and the dashboard workflow is unaffected by this filter — it has its
+    # own `on:` block).
+    paths:
+      - 'processor/**'
+      - 'replay/**'
+      - 'loader/**'
+      - 'docker/Dockerfile.pipeline'
+      - 'docker/pipeline-entrypoint.sh'
+      - 'docker/pipeline-requirements.txt'
+      - '.dockerignore'
+      - '.github/workflows/build-pipeline.yml'
+  workflow_dispatch:   # manual rebuild without a code change
+
+concurrency:
+  # One build in flight per branch; a newer push cancels an in-progress run
+  # so GHCR doesn't end up with a stale `latest`.
+  group: build-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository is already <owner>/<repo>; the image name is derived
+  # from the repo name so forks don't collide.
+  IMAGE_NAME: ${{ github.repository_owner }}/carevault-pipeline
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to push to ghcr.io/<owner>/*. The dashboard workflow doesn't
+      # grant this; GitHub scopes permissions per workflow, so they can't
+      # collide.
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Derive image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # type=raw latest only on default branch (safety for future branch
+          # pushes); type=sha gives short + long tags.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+            type=sha,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.pipeline
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA layer cache so unchanged pip layers don't reinstall every
+          # push. Scopes to this workflow so the dashboard build (if it ever
+          # grows a cache) doesn't collide.
+          cache-from: type=gha,scope=build-pipeline
+          cache-to: type=gha,mode=max,scope=build-pipeline
+
+      - name: Summary
+        run: |
+          {
+            echo "## Pipeline image published"
+            echo ""
+            echo "Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Pull from Azure Container Apps job with:"
+            echo "  --image ghcr.io/${{ env.IMAGE_NAME }}:latest"
+            echo "  --image ghcr.io/${{ env.IMAGE_NAME }}:sha-$(echo ${{ github.sha }} | cut -c1-7)   # immutable pin for a specific run"
+          } >> "$GITHUB_STEP_SUMMARY"
