@@ -1,0 +1,229 @@
+name: Run CareVault pipeline (scheduled, runner-direct)
+
+# Replaces the planned Azure Container Apps deployment. The Student
+# subscription this project runs under blocks ACR Tasks AND forces an
+# Express managed environment, which does not support Container Apps
+# jobs. GitHub Actions runs the same Python directly on an ubuntu-latest
+# runner instead; the Dockerfile under docker/ is kept as a record of
+# the attempted path but is NOT invoked by this workflow.
+#
+# Budget (private repo, 2000 free Actions minutes/month, shared with
+# build-pipeline.yml and main_carevault-dash-kb.yml):
+#   3 runs/day × 30 days × ~17 min/run ≈ 1,530 min/month,
+#   leaving ~470 min for the two build workflows and manual re-triggers.
+
+on:
+  schedule:
+    # Three runs per day, spread across New York working hours (9am, 1pm,
+    # 5pm ET). GitHub cron is in UTC and does NOT shift for daylight-saving;
+    # the schedule below is set for EDT. On the first Sunday of November
+    # (DST ends), update to the EST block below and revert in mid-March.
+    #
+    # EDT (UTC-4) — in effect ~March → first Sunday of November:
+    #   13:00 UTC = 09:00 ET
+    #   17:00 UTC = 13:00 ET
+    #   21:00 UTC = 17:00 ET
+    - cron: '0 13,17,21 * * *'
+    #
+    # EST (UTC-5) — in effect November → March:
+    #   14:00 UTC = 09:00 ET
+    #   18:00 UTC = 13:00 ET
+    #   22:00 UTC = 17:00 ET
+    # - cron: '0 14,18,22 * * *'
+  workflow_dispatch:   # manual trigger (demo-time)
+
+concurrency:
+  # Serialize executions so two runs can't fight over worker_cursor /
+  # worker_state. If a new run is triggered while one is in-flight (either
+  # overlap of a long run with the next scheduled slot, or a manual
+  # dispatch while a scheduled one is running), the new one waits rather
+  # than cancelling the in-flight one — a cancel mid-replay would leave
+  # the DB in a weird transient state.
+  group: run-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # for actions/checkout; no write perms needed anywhere
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # Hard safety net. Expected: ~30 s setup + ~30 s cached pip + ~30 s
+    # worker prewarm + 900 s replay + 60 s drain + ~10 s shutdown ≈ 17 min
+    # typical, 18-19 min worst case. 22 min stops a hang from quietly
+    # consuming the monthly budget.
+    timeout-minutes: 22
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13 with pip cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          # Cache keyed on the pinned deps file. Cold install (first run on
+          # a key) is ~2-3 min because scipy/numpy/river are big wheels;
+          # subsequent runs are ~15-30 s. Shared across workflows in the
+          # repo via GitHub's actions-cache store.
+          cache: 'pip'
+          cache-dependency-path: docker/pipeline-requirements.txt
+
+      - name: Install pipeline dependencies
+        run: pip install -r docker/pipeline-requirements.txt
+
+      - name: Run worker + replayer (15 min, 500 vps, speed 5)
+        env:
+          # Repository secrets. GHA masks these values in any log line that
+          # would print them literally. Steps NEVER echo these variables.
+          CAREVAULT_PG:                 ${{ secrets.CAREVAULT_PG }}
+          CAREVAULT_PROCESSOR_PG:       ${{ secrets.CAREVAULT_PROCESSOR_PG }}
+          # Pipeline knobs. All non-secret, all tweakable without touching
+          # the workflow — rewire via gh workflow run or edit here.
+          PIPELINE_VP_COUNT:            '500'
+          PIPELINE_SPEED:               '5'
+          PIPELINE_DURATION_SEC:        '900'    # 15 min replay
+          PIPELINE_PREWARM_TIMEOUT_SEC: '300'    # 5 min cap on worker prewarm
+          PIPELINE_DRAIN_SEC:           '60'     # worker's final flush
+          PIPELINE_SHUTDOWN_SEC:        '60'     # grace between TERM and KILL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          log() { printf '[run %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+          : "${CAREVAULT_PG:?secret CAREVAULT_PG not set in repo settings}"
+          : "${CAREVAULT_PROCESSOR_PG:?secret CAREVAULT_PROCESSOR_PG not set in repo settings}"
+
+          STARTUP_LOG="/tmp/worker_startup.log"
+          rm -f "$STARTUP_LOG"
+          export PROCESSOR_STARTUP_LOG="$STARTUP_LOG"
+
+          # ---- seed vps if the table is empty (first-ever run) --------
+          # Idempotent-upsert on every run would also be safe, but the
+          # explicit "if empty" check means routine runs touch
+          # live.virtual_patient zero times.
+          existing_vps=$(python - <<'PY'
+          import os, psycopg
+          with psycopg.connect(os.environ["CAREVAULT_PG"]) as c, c.cursor() as cur:
+              cur.execute("SELECT count(*) FROM live.virtual_patient")
+              print(cur.fetchone()[0])
+          PY
+          )
+          log "live.virtual_patient rows found: $existing_vps"
+          if [ "$existing_vps" = "0" ]; then
+            log "table empty — seeding $PIPELINE_VP_COUNT vps at speed=$PIPELINE_SPEED"
+            python -u replay/build_vps.py \
+                --count "$PIPELINE_VP_COUNT" --seed 42 \
+                --speed "$PIPELINE_SPEED" --source-cohort AZT1D
+          else
+            log "skipping seed (table already populated)"
+          fi
+
+          # ---- start worker in background -----------------------------
+          log "starting worker"
+          python -u processor/worker.py --shard 0 --num-shards 1 &
+          WORKER_PID=$!
+          log "worker pid=$WORKER_PID"
+
+          # EXIT trap: whatever happens from here on, the worker gets
+          # SIGTERM'd and reaped so the job doesn't orphan a process (and
+          # therefore doesn't hang GHA at the end of the step).
+          cleanup_worker() {
+            if kill -0 "$WORKER_PID" 2>/dev/null; then
+              log "cleanup: TERM worker pid=$WORKER_PID"
+              kill -TERM "$WORKER_PID" 2>/dev/null || true
+              for _ in $(seq 1 "$PIPELINE_SHUTDOWN_SEC"); do
+                kill -0 "$WORKER_PID" 2>/dev/null || break
+                sleep 1
+              done
+              if kill -0 "$WORKER_PID" 2>/dev/null; then
+                log "cleanup: worker didn't exit on TERM, sending KILL"
+                kill -KILL "$WORKER_PID" 2>/dev/null || true
+              fi
+              wait "$WORKER_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_worker EXIT
+
+          # ---- wait for prewarm_done ----------------------------------
+          # worker.py writes "<perf_counter>\tprewarm_done" to its
+          # PROCESSOR_STARTUP_LOG after the per-vp MAD-window backfill
+          # finishes. At 500 vps on Azure this takes ~30 s; wait up to
+          # PIPELINE_PREWARM_TIMEOUT_SEC for it.
+          log "waiting for worker prewarm (timeout=${PIPELINE_PREWARM_TIMEOUT_SEC}s)"
+          start=$SECONDS
+          while true; do
+            if [ -f "$STARTUP_LOG" ] && grep -q 'prewarm_done' "$STARTUP_LOG"; then
+              log "worker ready after $((SECONDS-start))s"
+              break
+            fi
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              log "FATAL: worker exited before prewarm finished"
+              echo "----- worker startup log -----"
+              cat "$STARTUP_LOG" 2>/dev/null || echo "(empty)"
+              echo "----- end -----"
+              exit 1
+            fi
+            if (( SECONDS - start > PIPELINE_PREWARM_TIMEOUT_SEC )); then
+              log "FATAL: prewarm did not complete in ${PIPELINE_PREWARM_TIMEOUT_SEC}s"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # ---- replayer in the foreground -----------------------------
+          log "starting replayer for ${PIPELINE_DURATION_SEC}s"
+          REPLAY_EXIT=0
+          python -u replay/run.py \
+              --vp-count "$PIPELINE_VP_COUNT" --speed "$PIPELINE_SPEED" \
+              --duration "$PIPELINE_DURATION_SEC" \
+              || REPLAY_EXIT=$?
+          log "replayer exited with code=$REPLAY_EXIT"
+
+          # ---- drain --------------------------------------------------
+          # Replayer stops producing; the worker's final fetch cycle still
+          # has to commit alerts + resolve pending predictions.
+          log "draining worker for ${PIPELINE_DRAIN_SEC}s"
+          sleep "$PIPELINE_DRAIN_SEC"
+
+          # ---- stop worker cleanly -----------------------------------
+          # Trap handler does the work; call it explicitly, then clear the
+          # trap so we don't double-run on exit.
+          log "stopping worker"
+          cleanup_worker
+          trap - EXIT
+
+          log "done; exit=$REPLAY_EXIT"
+          exit "$REPLAY_EXIT"
+
+      - name: Verification (post-run DB counts)
+        if: always()        # run even if the previous step failed, so we can see state
+        env:
+          CAREVAULT_PG: ${{ secrets.CAREVAULT_PG }}
+        shell: bash
+        run: |
+          set -eo pipefail
+          python - <<'PY'
+          import os, psycopg
+          with psycopg.connect(os.environ["CAREVAULT_PG"]) as c, c.cursor() as cur:
+              cur.execute("""
+                  SELECT max(event_time)                        AS latest_event_time,
+                         count(*) FILTER (WHERE ingested_at > now() - interval '30 minutes') AS rows_last_30m,
+                         count(DISTINCT virtual_patient_id)     AS vps_total
+                    FROM live.vitals_readings
+              """)
+              latest, rows_30m, vps = cur.fetchone()
+              print(f"latest_event_time: {latest}")
+              print(f"rows_last_30m:     {rows_30m}")
+              print(f"vps_total:         {vps}")
+              cur.execute("""
+                  SELECT detector, count(*)
+                    FROM live.alerts
+                   WHERE emitted_at > now() - interval '30 minutes'
+                   GROUP BY detector ORDER BY detector
+              """)
+              print("alerts_last_30m_by_detector:")
+              for r in cur.fetchall():
+                  print(f"  {r[0]:<16} {r[1]:>7}")
+          PY
