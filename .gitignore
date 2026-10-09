@@ -1,5 +1,5 @@
 # CareVault — files that should never be checked in.
-
+run_pipeline.bat
 # --- secrets ---------------------------------------------------------------
 .env
 .env.*

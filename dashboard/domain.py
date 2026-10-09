@@ -169,7 +169,22 @@ def _phrase(rule_id: str | None, detector: str | None, payload: Any,
             device_offset: float | None) -> tuple[str, str]:
     """Return (headline, evidence). The evidence line must state the numbers
     that triggered the alert whenever we have them. Never uses rule_id or
-    detector wording."""
+    detector wording.
+
+    Returns ("", "") when there is no recent alert at all (rule_id is None),
+    AND when the alert's rule_id isn't one this function knows how to phrase.
+    Callers must suppress the row entirely rather than render an empty string
+    with surrounding punctuation. The old vague fallback ("The system flagged
+    this, but we can't summarise it without checking directly") was leaking
+    into the UI any time rule_id was None, which is the normal state for a
+    quiet person.
+    """
+    # ---- No alert at all ----
+    # Common case: the vp has no alert in the lookback window. Return empty
+    # so the "evidence" line beneath the trend arrow renders blank. This is
+    # the right answer — there is literally nothing to say.
+    if rule_id is None:
+        return ("", "")
     # ---- CGM null / dropout
     if rule_id == "rules.cgm_null":
         return (
@@ -322,6 +337,29 @@ def _phrase(rule_id: str | None, detector: str | None, payload: Any,
             )
         return ("Blood sugar is above the safe range",
                 "Repeated highs slowly damage blood vessels.")
+    # ---- MAD on CGM. The MAD-on-CGM detector is deliberately kept out of
+    # the spike-mapping (its false-positive rate on clean readings is too
+    # high — see docs/results.md §4.3/§4.4), but it still EMITS alerts, so
+    # the dashboard needs language for them. Treat as "unusual swing" rather
+    # than claiming a sensor fault or a clinical event.
+    if rule_id == "mad.cgm_z_gt_3_5":
+        v = _num(_payload_get(payload, "cgm_mgdl")) or cgm_now
+        z = _num(_payload_get(payload, "z"))
+        if v is not None and z is not None:
+            return (
+                f"Blood sugar swung to {v:.0f} mg/dL",
+                f"That's {abs(z):.1f}× this person's usual variation; "
+                f"watch for a confirming reading in the next few minutes.",
+            )
+        if v is not None:
+            return (
+                f"Blood sugar swung to {v:.0f} mg/dL",
+                "Larger than this person's usual variation; "
+                "watch for a confirming reading in the next few minutes.",
+            )
+        return ("Blood sugar swung out of its usual pattern",
+                "Larger than this person's usual variation; "
+                "watch for a confirming reading in the next few minutes.")
     # ---- MAD on HR / SpO2
     if rule_id == "mad.hr_z_gt_3_5":
         z = _num(_payload_get(payload, "z"))
@@ -362,9 +400,11 @@ def _phrase(rule_id: str | None, detector: str | None, payload: Any,
                     "rules.diastolic_bp_mmhg_out_of_range"):
         return ("Blood pressure is outside normal limits",
                 "Above or below what's medically plausible.")
-    # ---- Fallback (should be rare)
-    return ("Something is off with this reading",
-            "The system flagged this, but we can't summarise it without checking directly.")
+    # ---- Fallback: unknown rule_id. Return empty instead of a vague
+    # "something is off" placeholder — a UI line that confesses it can't
+    # explain itself is worse than no line at all. Callers suppress the row
+    # when both strings are empty.
+    return ("", "")
 
 
 # --------------------------------------------------------------------------
@@ -480,34 +520,42 @@ def age_from_ts(ts: datetime | None) -> float | None:
 # batch's readings). That's the "how many points higher than the rest" the
 # operator sees, and it doesn't sag when the suspect batch has a lot of vps
 # and biases the fleet median toward itself.
+# Source + window match processor/outliers.py::BatchAnalyzer so the medians
+# the operator sees are exactly the medians the detector is comparing. The
+# earlier version read live.vitals_1min with a 15-minute window; that was
+# both wider than the detector's 120 s window and dependent on the 1-min
+# aggregator having rolled up the latest minute. The card could sit on
+# "not enough readings yet" while the alerts table showed fresh
+# batch_analysis evidence quoting raw-reading counts. Reading raw rows over
+# the detector's window keeps the two in step.
 BATCH_BIAS_SQL = """
   WITH per_batch AS (
     SELECT d.firmware_version AS fw,
            count(DISTINCT d.virtual_patient_id) AS n_devices,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY v.cgm_mgdl_mean) AS median_cgm,
-           count(v.cgm_mgdl_mean)               AS n_readings
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY v.cgm_mgdl) AS median_cgm,
+           count(v.cgm_mgdl)                    AS n_readings
       FROM live.device d
-      LEFT JOIN live.vitals_1min v
+      LEFT JOIN live.vitals_readings v
         ON v.virtual_patient_id = d.virtual_patient_id
-       AND v.minute_start_utc > now() - interval '15 minutes'
-       AND v.cgm_mgdl_mean IS NOT NULL
+       AND v.event_time > now() - interval '120 seconds'
+       AND v.cgm_mgdl IS NOT NULL
      GROUP BY d.firmware_version
   ),
   fleet AS (
-    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cgm_mgdl_mean) AS median_fleet
-      FROM live.vitals_1min
-     WHERE minute_start_utc > now() - interval '15 minutes'
-       AND cgm_mgdl_mean IS NOT NULL
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cgm_mgdl) AS median_fleet
+      FROM live.vitals_readings
+     WHERE event_time > now() - interval '120 seconds'
+       AND cgm_mgdl IS NOT NULL
   ),
   -- median across every reading that did NOT come from this batch
   others_median AS (
     SELECT b.fw,
-           (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v2.cgm_mgdl_mean)
-              FROM live.vitals_1min v2
+           (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v2.cgm_mgdl)
+              FROM live.vitals_readings v2
               JOIN live.device d2 ON d2.virtual_patient_id = v2.virtual_patient_id
              WHERE d2.firmware_version <> b.fw
-               AND v2.minute_start_utc > now() - interval '15 minutes'
-               AND v2.cgm_mgdl_mean IS NOT NULL)  AS median_others
+               AND v2.event_time > now() - interval '120 seconds'
+               AND v2.cgm_mgdl IS NOT NULL)  AS median_others
       FROM per_batch b
   )
   SELECT p.fw,

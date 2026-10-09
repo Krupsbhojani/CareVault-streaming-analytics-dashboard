@@ -191,6 +191,14 @@ def _fetch_top_alerts(lookback_min: int) -> pd.DataFrame:
            AND rule_id = ANY(%(rules)s)
       ),
       top_per_vp AS (
+        -- Priority: clinical events outrank sensor faults. A patient whose
+        -- monitor is in a suspect firmware batch AND whose sugar is below 70
+        -- should surface as a health event, not as a device issue — the
+        -- actionable thing is the person, and the firmware offset is a
+        -- fleet-wide concern surfaced separately in the device-check card.
+        -- The earlier order put batch_analysis.firmware_offset ahead of the
+        -- bare hypo/hyper thresholds, which hid every real health event on
+        -- any vp whose device also had the firmware offset injected.
         SELECT DISTINCT ON (virtual_patient_id)
                virtual_patient_id  AS vp,
                emitted_at,
@@ -204,13 +212,13 @@ def _fetch_top_alerts(lookback_min: int) -> pd.DataFrame:
          ORDER BY virtual_patient_id,
                   (CASE
                      WHEN rule_id = 'cross_signal.hypo_confirmed_by_hr' THEN 0
+                     WHEN rule_id IN ('rules.hypo_threshold',
+                                      'rules.hyper_threshold')         THEN 1
                      WHEN rule_id IN ('rules.cgm_roc_spike',
                                       'rules.cgm_out_of_range',
-                                      'rules.cgm_null')                THEN 1
-                     WHEN rule_id = 'batch_analysis.firmware_offset'   THEN 2
+                                      'rules.cgm_null')                THEN 2
                      WHEN rule_id = 'rules.cgm_stuck'                  THEN 3
-                     WHEN rule_id IN ('rules.hypo_threshold',
-                                      'rules.hyper_threshold')         THEN 4
+                     WHEN rule_id = 'batch_analysis.firmware_offset'   THEN 4
                      ELSE                                                    5
                    END),
                   trigger_event_time DESC

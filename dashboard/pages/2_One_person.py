@@ -131,14 +131,34 @@ def _fetch_top(vp: str) -> pd.DataFrame:
          ORDER BY event_time DESC
          LIMIT 1
     """, (vp,))
+    # Trend window must match what the chart draws (last 60 min of event-time
+    # anchored to this vp's own max event_time, same as _fetch_cgm_series).
+    # The old 3-min-event lookback shows "steady" during a visible climb when
+    # the climb plateaus near the right edge — a direct contradiction of the
+    # chart below. Compute delta from the first vs last reading in the chart
+    # window, normalised by the actual event-time span in that window.
     trend = timed_query("op_trend", """
-        SELECT avg(cgm_mgdl) AS cgm_3m
-          FROM live.vitals_readings
-         WHERE virtual_patient_id = %s
-           AND event_time >  now() - interval '4 minutes'
-           AND event_time <= now() - interval '3 minutes'
-           AND cgm_mgdl IS NOT NULL
-    """, (vp,))
+        WITH anchor AS (
+            SELECT max(event_time) AS vp_max_et
+              FROM live.vitals_readings
+             WHERE virtual_patient_id = %s AND cgm_mgdl IS NOT NULL
+        ),
+        in_window AS (
+            SELECT event_time, cgm_mgdl
+              FROM live.vitals_readings, anchor
+             WHERE virtual_patient_id = %s
+               AND cgm_mgdl IS NOT NULL
+               AND event_time >  vp_max_et - interval '60 minutes'
+               AND event_time <= vp_max_et
+        )
+        SELECT
+          (SELECT cgm_mgdl FROM in_window ORDER BY event_time ASC  LIMIT 1) AS cgm_first,
+          (SELECT cgm_mgdl FROM in_window ORDER BY event_time DESC LIMIT 1) AS cgm_last,
+          extract(epoch FROM (
+              (SELECT max(event_time) FROM in_window) -
+              (SELECT min(event_time) FROM in_window)
+          )) / 60.0 AS span_min
+    """, (vp, vp))
     alert = timed_query("op_top_alert", """
         SELECT emitted_at, alert_type, severity, rule_id, detector, payload_json
           FROM live.alerts
@@ -184,8 +204,14 @@ def _fetch_top(vp: str) -> pd.DataFrame:
         "spo2_now": lat["spo2_pct"],
         "sampling_sec": lat["sampling_sec"],
         "age_sec": age_from_ts(lat["event_time"]),
-        "delta_per_min": (None if (tr is None or pd.isna(tr["cgm_3m"]) or lat["cgm_mgdl"] is None)
-                          else (float(lat["cgm_mgdl"]) - float(tr["cgm_3m"])) / 3.0),
+        # delta_per_min: average mg/dL per event-minute across the chart's
+        # 60-min window. Positive = up, negative = down. None if there's no
+        # usable trend data yet (fewer than 2 readings or a zero-length span).
+        "delta_per_min": (
+            None if (tr is None or pd.isna(tr["cgm_first"]) or pd.isna(tr["cgm_last"])
+                     or pd.isna(tr["span_min"]) or float(tr["span_min"]) <= 0)
+            else (float(tr["cgm_last"]) - float(tr["cgm_first"])) / float(tr["span_min"])
+        ),
         "rule_id": None if al is None else al["rule_id"],
         "detector": None if al is None else al["detector"],
         "alert_type": None if al is None else al["alert_type"],
@@ -236,11 +262,17 @@ def _fetch_cgm_series(vp: str, minutes: int = 60) -> pd.DataFrame:
 
 def _fetch_recent_predictions(vp: str, minutes: int = 60) -> pd.DataFrame:
     """Historical predictions over the last `minutes` of this vp's event-time
-    for the two baseline models. Joined to live.vitals_readings on
-    predicted_ts_utc = event_time (same semantics as
-    scratch/forecast_check.py), so every prediction row we return had an
-    actual reading at exactly its target timestamp — i.e. the forecast was
-    resolvable."""
+    for the two baseline models, restricted to predictions the ML pipeline
+    has already resolved (actual_cgm_mgdl IS NOT NULL).
+
+    We used to join live.predictions to live.vitals_readings on
+    `v.event_time = p.predicted_ts_utc`, but that's an exact-equality on a
+    computed timestamp (input_window_end + horizon) that almost never aligns
+    with a real reading's `now()`-stamped event_time. The ML pipeline
+    resolves predictions with a ±(TOLERANCE_SEC_SOURCE / speed) tolerance,
+    so filtering by `actual_cgm_mgdl IS NOT NULL` gets exactly the set the
+    pipeline matched — same intent as the join, correct semantics.
+    """
     return timed_query("op_recent_predictions", """
         WITH anchor AS (
             SELECT max(event_time) AS vp_max_et
@@ -251,15 +283,13 @@ def _fetch_recent_predictions(vp: str, minutes: int = 60) -> pd.DataFrame:
                p.predicted_ts_utc    AS ts,
                p.predicted_cgm_mgdl  AS cgm
           FROM live.predictions p
-          JOIN live.vitals_readings v
-            ON v.virtual_patient_id = p.virtual_patient_id
-           AND v.event_time         = p.predicted_ts_utc
-         CROSS JOIN anchor a
+          CROSS JOIN anchor a
          WHERE p.virtual_patient_id = %s
            AND p.model_name IN ('persistence', 'linear_trend')
            AND p.predicted_ts_utc > a.vp_max_et - make_interval(mins => %s)
            AND p.predicted_ts_utc <= a.vp_max_et
            AND p.predicted_cgm_mgdl IS NOT NULL
+           AND p.actual_cgm_mgdl    IS NOT NULL
          ORDER BY p.model_name, p.predicted_ts_utc
     """, (vp, vp, minutes))
 
@@ -431,7 +461,7 @@ def top_card_fragment() -> None:
     err_source = "none"
     if not err.empty:
         r = err.iloc[0]
-        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+        if (r.get("n_mine") or 0) >= 5 and r.get("p50_mine") is not None:
             typical_err = float(r["p50_mine"]); err_source = "mine"
         elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
             typical_err = float(r["p50_global"]); err_source = "global"
@@ -505,6 +535,16 @@ def top_card_fragment() -> None:
         "recovering":  "recovering",
     }.get(s.going, s.going)
 
+    # Suppress the evidence line entirely when _phrase returned "" (no
+    # recent alert, or an alert this UI doesn't know how to summarise).
+    # Rendering an empty <div> leaves a vertical gap under the arrow; the
+    # intent of the row is per-alert context, so with no alert there's
+    # nothing to put there.
+    evidence_html = (
+        f'<div style="font-size:12px; color:#5C6A70; margin-top:4px;">{s.evidence}</div>'
+        if (s.evidence or "").strip() else ''
+    )
+
     st.markdown(
         '<div class="card">'
         '<div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;">'
@@ -520,8 +560,7 @@ def top_card_fragment() -> None:
         f'<div style="display:flex; align-items:center; gap:8px; margin-top:6px;">'
         f'  {going_icon}<span class="mid-value">{going_plain}</span>'
         '</div>'
-        f'<div style="font-size:12px; color:#5C6A70; margin-top:4px;">'
-        f'{s.evidence}</div>'
+        f'{evidence_html}'
         '</div>'
         f'{forecast_html}'
         '</div>'
@@ -745,7 +784,7 @@ def chart_fragment() -> None:
     typical_err = None
     if not err_df.empty:
         r = err_df.iloc[0]
-        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+        if (r.get("n_mine") or 0) >= 5 and r.get("p50_mine") is not None:
             typical_err = float(r["p50_mine"])
         elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
             typical_err = float(r["p50_global"])
@@ -1095,7 +1134,7 @@ def prediction_card() -> None:
     err_scope = ""
     if not err_df.empty:
         r = err_df.iloc[0]
-        if (r.get("n_mine") or 0) >= 20 and r.get("p50_mine") is not None:
+        if (r.get("n_mine") or 0) >= 5 and r.get("p50_mine") is not None:
             row1 = f"about {int(round(float(r['p50_mine'])))} mg/dL off, half the time"
             err_scope = f"from this person's last {int(r['n_mine'])} resolved guesses"
         elif (r.get("n_global") or 0) >= 50 and r.get("p50_global") is not None:
